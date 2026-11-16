@@ -808,10 +808,10 @@ fn downgrade_render_cache_keeps_downscaled_tier_warm() {
         height: h,
         ..Default::default()
     };
-    // sub=2 request: half-resolution output.
+    // sub=2 request: colorbook's background is stored at a third, so a sixth-size render is sub=2.
     let opts_s2 = RenderOptions {
-        width: w / 2,
-        height: h / 2,
+        width: w / 6,
+        height: h / 6,
         ..Default::default()
     };
 
@@ -848,10 +848,10 @@ fn full_decode_resumed_from_partial_is_byte_identical() {
         let p = doc_a.page(0).unwrap();
         (p.width() as u32, p.height() as u32)
     };
-    // Warm the partial tier via a sub=4 render, then full render.
+    // Warm the partial tier via a sub=4 render (a twelfth: the background is a third).
     let opts_s4 = RenderOptions {
-        width: w / 4,
-        height: h / 4,
+        width: w / 12,
+        height: h / 12,
         ..Default::default()
     };
     let opts_s1 = RenderOptions {
