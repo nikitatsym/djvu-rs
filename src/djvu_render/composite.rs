@@ -74,7 +74,10 @@ pub(super) struct CompositeContext<'a> {
 
 #[derive(Clone, Copy)]
 pub(super) struct AreaAvgX {
+    /// Where the output column starts and where the next one starts, in
+    /// `1 / FRAC` page pixels.
     pub(super) fx: u32,
+    pub(super) fx_end: u32,
     pub(super) bg_x0: u32,
     pub(super) bg_x1: u32,
 }
@@ -89,20 +92,26 @@ pub(super) fn area_range(limit: u32, f: u32, step: u32) -> (u32, u32) {
     )
 }
 
-pub(super) fn precompute_area_avg_x(
-    ctx: &CompositeContext<'_>,
-    fx_step: u32,
-    bg_fx_step: u32,
-) -> Vec<AreaAvgX> {
-    let mut xs = Vec::with_capacity(ctx.out_w as usize);
-    let bg_w = ctx.bg.map_or(0, |bg| bg.width());
-    for ox in 0..ctx.out_w {
-        let fx = (ox + ctx.offset_x) * fx_step;
-        let bg_fx = ((fx as u64 * ctx.bg_x_q24) >> 24) as u32;
-        let (bg_x0, bg_x1) = area_range(bg_w, bg_fx, bg_fx_step);
-        xs.push(AreaAvgX { fx, bg_x0, bg_x1 });
+pub(super) fn precompute_area_avg_x(ctx: &CompositeContext<'_>, fx_step: Step) -> Vec<AreaAvgX> {
+    (0..ctx.out_w)
+        .map(|ox| column_footprint(ctx, fx_step, ox + ctx.offset_x))
+        .collect()
+}
+
+/// The footprint of output column `x`: from where it starts to where the next
+/// one starts, so that every page column falls in some output column.
+#[inline]
+pub(super) fn column_footprint(ctx: &CompositeContext<'_>, fx_step: Step, x: u32) -> AreaAvgX {
+    let (fx, fx_end) = (fx_step.at(x), fx_step.at(x + 1));
+    let bg_fx = ((fx as u64 * ctx.bg_x_q24) >> 24) as u32;
+    let bg_fx_end = plane_end(fx_end, ctx.page_w, ctx.bg_x_q24);
+    let (bg_x0, bg_x1) = area_range(ctx.bg.map_or(0, |bg| bg.width()), bg_fx, bg_fx_end - bg_fx);
+    AreaAvgX {
+        fx,
+        fx_end,
+        bg_x0,
+        bg_x1,
     }
-    xs
 }
 
 /// Per-output-column bg sampling data for the bilinear (upscale / 1:1) path:
@@ -126,14 +135,14 @@ pub(super) enum BgRow<'s> {
     Blend(&'s [[u16; 4]], u32, u32),
 }
 
-/// Build the per-column table for [`composite_rows_bilinear_one`]. Walks the
-/// exact Q48 fixed-point accumulator of the in-loop fallback (`bg_fx_q`), so
-/// table lookups and the fallback produce byte-identical coordinates.
+/// Build the per-column table for [`composite_rows_bilinear_one`]. Takes the
+/// same [`PlaneWalk`] as the in-loop fallback, so table lookups and the
+/// fallback produce byte-identical coordinates.
 /// When [`CompositeContext::bg_red`] is set, the table holds the
 /// [`scaler_x`] entries instead, and the fallback is not used.
 pub(super) fn precompute_bilinear_x(
     ctx: &CompositeContext<'_>,
-    fx_step: u32,
+    fx_step: Step,
 ) -> Option<Vec<BilinearX>> {
     let bg = ctx.bg?;
     if ctx.bg_red != 0 {
@@ -144,18 +153,17 @@ pub(super) fn precompute_bilinear_x(
         );
     }
     let clamp_w = bg.width().saturating_sub(1);
-    let bg_fx_step_q: u64 = fx_step as u64 * ctx.bg_x_q24;
-    let mut bg_fx_q: u64 = (ctx.offset_x as u64 * fx_step as u64 + FRAC as u64 / 2) * ctx.bg_x_q24;
+    let mut walk = PlaneWalk::new(fx_step, ctx.offset_x, ctx.bg_x_q24);
     let mut xs = Vec::with_capacity(ctx.out_w as usize);
     for _ in 0..ctx.out_w {
-        let bg_fx = ((bg_fx_q >> 24) as u32).saturating_sub(FRAC / 2);
+        let bg_fx = ((walk.q() >> 24) as u32).saturating_sub(FRAC / 2);
         let x0 = (bg_fx >> FRACBITS).min(clamp_w);
         xs.push(BilinearX {
             x0,
             x1: (x0 + 1).min(clamp_w),
             tx: bg_fx & FRAC_MASK,
         });
-        bg_fx_q = bg_fx_q.wrapping_add(bg_fx_step_q);
+        walk.advance();
     }
     Some(xs)
 }
@@ -354,16 +362,17 @@ pub(super) fn bg_rows_needed(
     if rows.is_empty() || plane_h == 0 {
         return (0, 0);
     }
-    let fx_step = ((page_w as u64 * FRAC as u64) / full_w.max(1) as u64) as u32;
-    let fy_step = ((page_h as u64 * FRAC as u64) / full_h.max(1) as u64) as u32;
+    let fx_step = Step::new(page_w, full_w);
+    let fy_step = Step::new(page_h, full_h);
     let (_, bg_y_q24) = bg_q24(Some(plane), page_w, page_h);
     let first = rows.start;
     let last = rows.end - 1;
-    if fx_step > FRAC || fy_step > FRAC {
-        let bg_fy_step = ((fy_step as u64 * bg_y_q24) >> 24) as u32;
-        let row_of = |oy: u32| (((oy * fy_step) as u64 * bg_y_q24) >> 24) as u32;
-        let (lo, _) = area_range(plane_h, row_of(first), bg_fy_step);
-        let (y0, y1) = area_range(plane_h, row_of(last), bg_fy_step);
+    if fx_step.shrinks() || fy_step.shrinks() {
+        // A row reads plane rows from where it starts to where the next starts.
+        let row_of = |oy: u32| ((u64::from(fy_step.at(oy)) * bg_y_q24) >> 24) as u32;
+        let end_of = |oy: u32| plane_end(fy_step.at(oy + 1), page_h, bg_y_q24);
+        let (lo, _) = area_range(plane_h, row_of(first), end_of(first) - row_of(first));
+        let (y0, y1) = area_range(plane_h, row_of(last), end_of(last) - row_of(last));
         (lo, y1.max(y0 + 1))
     } else if let red @ 1.. = native_bg_red((page_w, page_h), (full_w, full_h), plane) {
         // Rows grow downwards while the scaler counts from the bottom:
@@ -374,7 +383,7 @@ pub(super) fn bg_rows_needed(
     } else {
         let clamp_h = plane_h - 1;
         let row_of =
-            |oy: u32| (map_plane_center_frac(oy * fy_step, bg_y_q24) >> FRACBITS).min(clamp_h);
+            |oy: u32| (map_plane_center_frac(fy_step.at(oy), bg_y_q24) >> FRACBITS).min(clamp_h);
         let lo = row_of(first);
         let hi = (row_of(last) + 1).min(clamp_h) + 1;
         (lo, hi)
@@ -385,11 +394,9 @@ pub(super) fn bg_rows_needed(
 /// every sampler's reach, so that a band decoded with only these columns
 /// ([`Iw44Image::rgb_window`]) holds every pixel the composite reads.
 ///
-/// Mirrors the column arithmetic of the compositor, truncated `fx_step`
-/// included: at `FRACBITS = 4` that truncation moves a column far from the
-/// page origin by several plane pixels. The reach adds one output pixel's
-/// footprint in the plane (the area average reads that much), the bilinear
-/// and scaler neighbour, and a pixel of rounding on each side.
+/// Mirrors the column arithmetic of the compositor. The reach adds one output
+/// pixel's footprint in the plane (the area average reads that much), the
+/// bilinear and scaler neighbour, and a pixel of rounding on each side.
 pub(super) fn bg_cols_needed(
     page_w: u32,
     full_w: u32,
@@ -399,11 +406,10 @@ pub(super) fn bg_cols_needed(
     if cols.is_empty() || plane_w == 0 {
         return 0..0;
     }
-    let fx_step = (u64::from(page_w) * u64::from(FRAC)) / u64::from(full_w.max(1));
+    let fx_step = Step::new(page_w, full_w);
     let (bg_x_q24, _) = bg_q24(Some((plane_w, 1)), page_w, 1);
-    let to_plane =
-        |ox: u32| (((u64::from(ox) * fx_step + u64::from(FRAC / 2)) * bg_x_q24) >> 24) >> FRACBITS;
-    let reach = (((fx_step * bg_x_q24) >> 24) >> FRACBITS) + 2;
+    let to_plane = |ox: u32| (fx_step.plane_q(ox, bg_x_q24) >> 24) >> FRACBITS;
+    let reach = ((fx_step.plane_step_q(bg_x_q24) >> 24) >> FRACBITS) + 2;
     let lo = to_plane(cols.start)
         .saturating_sub(reach)
         .min(u64::from(plane_w));
@@ -423,11 +429,11 @@ pub(super) fn bg_band_out_rows(
     out_h: u32,
     band_rows: u32,
 ) -> u32 {
-    let fy_step = ((page.1 as u64 * FRAC as u64) / full.1.max(1) as u64) as u32;
+    let fy_step = Step::new(page.1, full.1);
     let (_, bg_y_q24) = bg_q24(Some(plane), page.0, page.1);
     // Plane rows per output row, Q(FRACBITS + 24); a few rows of slack for
     // the clamped neighbour rows the samplers read.
-    let per_out = (fy_step as u64 * bg_y_q24).max(1);
+    let per_out = fy_step.plane_step_q(bg_y_q24).max(1);
     let rows = ((band_rows.saturating_sub(4) as u64) << (FRACBITS + 24)) / per_out;
     let mut rows = (rows.min(out_h as u64) as u32).max(1);
     // Safety net: never exceed the budget, whatever rounding did above.
@@ -533,9 +539,9 @@ pub(super) fn composite_into(
     let full_w = ctx.opts.width;
     let full_h = ctx.opts.height;
 
-    // Fixed-point step: how many source pixels per full-render output pixel
-    let fx_step = ((ctx.page_w as u64 * FRAC as u64) / full_w.max(1) as u64) as u32;
-    let fy_step = ((ctx.page_h as u64 * FRAC as u64) / full_h.max(1) as u64) as u32;
+    // How many source pixels each full-render output pixel covers.
+    let fx_step = Step::new(ctx.page_w, full_w);
+    let fy_step = Step::new(ctx.page_h, full_h);
 
     let row_stride = ctx.out_w as usize * 4;
 
@@ -564,11 +570,8 @@ pub(super) fn composite_into(
         return Ok(());
     }
 
-    let downscale = fx_step > FRAC || fy_step > FRAC;
-    // Precompute bg-space step for the area-average path (avoids per-pixel multiply).
-    let bg_fx_step = ((fx_step as u64 * ctx.bg_x_q24) >> 24) as u32;
-    let bg_fy_step = ((fy_step as u64 * ctx.bg_y_q24) >> 24) as u32;
-    let area_avg_x = downscale.then(|| precompute_area_avg_x(ctx, fx_step, bg_fx_step));
+    let downscale = fx_step.shrinks() || fy_step.shrinks();
+    let area_avg_x = downscale.then(|| precompute_area_avg_x(ctx, fx_step));
     let bilinear_x = (!downscale)
         .then(|| precompute_bilinear_x(ctx, fx_step))
         .flatten();
@@ -587,8 +590,6 @@ pub(super) fn composite_into(
                         oy as u32,
                         fx_step,
                         fy_step,
-                        bg_fx_step,
-                        bg_fy_step,
                         row,
                         area_avg_x.as_deref(),
                     );
@@ -618,8 +619,6 @@ pub(super) fn composite_into(
                     oy as u32,
                     fx_step,
                     fy_step,
-                    bg_fx_step,
-                    bg_fy_step,
                     row,
                     area_avg_x.as_deref(),
                 );
@@ -660,9 +659,9 @@ where
     let full_w = ctx.opts.width;
     let full_h = ctx.opts.height;
 
-    // Fixed-point step: how many source pixels per full-render output pixel.
-    let fx_step = ((ctx.page_w as u64 * FRAC as u64) / full_w.max(1) as u64) as u32;
-    let fy_step = ((ctx.page_h as u64 * FRAC as u64) / full_h.max(1) as u64) as u32;
+    // How many source pixels each full-render output pixel covers.
+    let fx_step = Step::new(ctx.page_w, full_w);
+    let fy_step = Step::new(ctx.page_h, full_h);
 
     let row_stride = ctx.out_w as usize * 4;
 
@@ -677,12 +676,8 @@ where
     }
 
     let mut row_buf = vec![0u8; row_stride];
-    let downscale = fx_step > FRAC || fy_step > FRAC;
-
-    // Precompute bg-space step for area-average path (avoids per-pixel multiply).
-    let bg_fx_step = ((fx_step as u64 * ctx.bg_x_q24) >> 24) as u32;
-    let bg_fy_step = ((fy_step as u64 * ctx.bg_y_q24) >> 24) as u32;
-    let area_avg_x = downscale.then(|| precompute_area_avg_x(ctx, fx_step, bg_fx_step));
+    let downscale = fx_step.shrinks() || fy_step.shrinks();
+    let area_avg_x = downscale.then(|| precompute_area_avg_x(ctx, fx_step));
     let bilinear_x = (!downscale)
         .then(|| precompute_bilinear_x(ctx, fx_step))
         .flatten();
@@ -695,8 +690,6 @@ where
                 oy,
                 fx_step,
                 fy_step,
-                bg_fx_step,
-                bg_fy_step,
                 &mut row_buf,
                 area_avg_x.as_deref(),
             );
@@ -722,8 +715,8 @@ where
 pub(super) fn composite_rows_bilevel_one(
     ctx: &CompositeContext<'_>,
     oy: u32,
-    fx_step: u32,
-    fy_step: u32,
+    fx_step: Step,
+    fy_step: Step,
     row_buf: &mut [u8],
 ) {
     let mask = match ctx.mask {
@@ -740,7 +733,7 @@ pub(super) fn composite_rows_bilevel_one(
     };
 
     // 1:1 scale fast path.
-    if fx_step == FRAC && fy_step == FRAC {
+    if fx_step.is_identity() && fy_step.is_identity() {
         let stride = mask.row_stride();
         // Same shape as the column clamp below: `mask.data` holds `mask.height`
         // rows, not `page_h` rows. An INFO chunk that declares a page taller
@@ -833,8 +826,8 @@ pub(super) fn composite_rows_bilevel_one(
         return;
     }
 
-    let downscale = fx_step > FRAC || fy_step > FRAC;
-    let fy = (oy + ctx.offset_y) * fy_step;
+    let downscale = fx_step.shrinks() || fy_step.shrinks();
+    let fy = fy_step.at(oy + ctx.offset_y);
     let py = (fy >> FRACBITS).min(ctx.page_h.saturating_sub(1));
 
     // I3-downscale: all-white band fast path for the anti-aliased path. The
@@ -848,7 +841,7 @@ pub(super) fn composite_rows_bilevel_one(
     if downscale && ctx.mask_shift == 0 {
         let stride = mask.row_stride();
         let y0 = (fy >> FRACBITS).min(mask.height.saturating_sub(1)) as usize;
-        let y1 = ((fy + fy_step) >> FRACBITS).min(mask.height) as usize;
+        let y1 = (fy_step.at(oy + ctx.offset_y + 1) >> FRACBITS).min(mask.height) as usize;
         if y1 <= y0 || !mask.data[y0 * stride..y1 * stride].iter().any(|&b| b != 0) {
             row_buf.fill(255);
             return;
@@ -856,7 +849,8 @@ pub(super) fn composite_rows_bilevel_one(
     }
 
     for (ox, pixel) in row_buf.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let fx = (ox as u32 + ctx.offset_x) * fx_step;
+        let fx = fx_step.at(ox as u32 + ctx.offset_x);
+        let fx_end = fx_step.at(ox as u32 + ctx.offset_x + 1);
         let px = (fx >> FRACBITS).min(ctx.page_w.saturating_sub(1));
 
         // ch = 0 → black (foreground), 255 → white (background).
@@ -874,7 +868,8 @@ pub(super) fn composite_rows_bilevel_one(
                 }
             } else {
                 // Anti-aliased: coverage fraction → gray.
-                255 - mask_box_coverage(mask, fx, fy, fx_step, fy_step)
+                let fy_end = fy_step.at(oy + ctx.offset_y + 1);
+                255 - mask_box_coverage(mask, fx, fy, fx_end - fx, fy_end - fy)
             }
         } else if ctx.opts.mask_aa && ctx.mask_shift == 0 {
             // D_AA_ZOOM (opt-in): this branch is only reachable past the exact
@@ -973,8 +968,8 @@ pub(super) fn bg_blend_pixel(
 pub(super) fn composite_rows_bilinear_one(
     ctx: &CompositeContext<'_>,
     oy: u32,
-    fx_step: u32,
-    fy_step: u32,
+    fx_step: Step,
+    fy_step: Step,
     row_buf: &mut [u8],
     bx: Option<&[BilinearX]>,
     vblend: &mut Vec<u16>,
@@ -983,7 +978,10 @@ pub(super) fn composite_rows_bilinear_one(
     // bilinear interpolation degrades to nearest-neighbour. Guard on the bg
     // plane ratio too: if bg is at subsample > 1, the bg coordinates are not
     // integer-aligned even at native scale and bilinear blending is needed.
-    if fx_step == FRAC && fy_step == FRAC && ctx.bg_x_q24 == (1 << 24) && ctx.bg_y_q24 == (1 << 24)
+    if fx_step.is_identity()
+        && fy_step.is_identity()
+        && ctx.bg_x_q24 == (1 << 24)
+        && ctx.bg_y_q24 == (1 << 24)
     {
         let (fy, py) = row_page_y(ctx, oy, fy_step);
         // Extra-tight path for the common corpus case: bg present, mask
@@ -1004,8 +1002,8 @@ pub(super) fn composite_rows_bilinear_one(
 
 /// The page-space fixed-point y of output row `oy` and its page row.
 #[inline(always)]
-fn row_page_y(ctx: &CompositeContext<'_>, oy: u32, fy_step: u32) -> (u32, u32) {
-    let fy = (oy + ctx.offset_y) * fy_step;
+fn row_page_y(ctx: &CompositeContext<'_>, oy: u32, fy_step: Step) -> (u32, u32) {
+    let fy = fy_step.at(oy + ctx.offset_y);
     (fy, (fy >> FRACBITS).min(ctx.page_h.saturating_sub(1)))
 }
 
@@ -1141,7 +1139,7 @@ fn native_row_bg_mask(ctx: &CompositeContext<'_>, bg: PlaneView<'_>, py: u32, ro
 
 /// A general 1:1 row (offset, palette, or FG44 present): nearest-neighbour.
 #[inline(always)]
-fn native_row(ctx: &CompositeContext<'_>, fy: u32, py: u32, fx_step: u32, row_buf: &mut [u8]) {
+fn native_row(ctx: &CompositeContext<'_>, fy: u32, py: u32, fx_step: Step, row_buf: &mut [u8]) {
     let (page_w, page_h) = (ctx.page_w, ctx.page_h);
     // C2: Pre-hoist FG44 y-rows (row-invariant, analogous to bg_rows in B-series path).
     // Eliminates per-fg-pixel: map_plane_center_frac(fy), y0/y1/ty computation, row lookups.
@@ -1183,7 +1181,7 @@ fn native_row(ctx: &CompositeContext<'_>, fy: u32, py: u32, fx_step: u32, row_bu
     let g1_mask = expand_mask_row(mask_row_1x1, &mut g1_buf);
 
     for (ox, pixel) in row_buf.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let fx = (ox as u32 + ctx.offset_x) * fx_step;
+        let fx = fx_step.at(ox as u32 + ctx.offset_x);
         let px = (fx >> FRACBITS).min(page_w.saturating_sub(1));
 
         // G1 fast path: single byte load. Falls back to bit-extraction when g1_mask
@@ -1333,8 +1331,8 @@ fn expand_mask_row<'b>(mask_row: Option<(&[u8], u32)>, g1_buf: &'b mut [u8; G1_M
 fn zoom_row(
     ctx: &CompositeContext<'_>,
     oy: u32,
-    fx_step: u32,
-    fy_step: u32,
+    fx_step: Step,
+    fy_step: Step,
     row_buf: &mut [u8],
     bx: Option<&[BilinearX]>,
     vblend: &mut Vec<u16>,
@@ -1342,12 +1340,11 @@ fn zoom_row(
     let (page_w, page_h) = (ctx.page_w, ctx.page_h);
     let (fy, py) = row_page_y(ctx, oy, fy_step);
 
-    // B1: replace the per-pixel u64 mul for bg_fx with an exact u64
-    // accumulator (add per pixel instead of multiply).
-    // bg_fx_q tracks (page_frac + FRAC/2) * bg_x_q24 in Q48; >> 24 gives the
+    // B1: walk the plane columns with an add per pixel instead of a multiply.
+    // The walk's q() is (page_frac + FRAC/2) * bg_x_q24 in Q48; >> 24 gives the
     // FRAC-fixed-point coordinate; subtract FRAC/2 to get the centered sample pos.
-    let bg_fx_step_q: u64 = fx_step as u64 * ctx.bg_x_q24;
-    let mut bg_fx_q: u64 = (ctx.offset_x as u64 * fx_step as u64 + FRAC as u64 / 2) * ctx.bg_x_q24;
+    let mut walk = PlaneWalk::new(fx_step, ctx.offset_x, ctx.bg_x_q24);
+    let last_q = fx_step.plane_q(ctx.offset_x + ctx.out_w.saturating_sub(1), ctx.bg_x_q24);
 
     // B2b: pre-hoist mask row slice for py (eliminates y*stride multiply per pixel).
     let mask_hoist = mask_row_at(ctx, py);
@@ -1381,7 +1378,7 @@ fn zoom_row(
         Some(bg) if ctx.bg_red != 0 => {
             Some(scaled_bg_row(ctx, bg, oy, row_buf.len() / 4, bx, vblend))
         }
-        Some(bg) => Some(blend_bg_row(ctx, bg, fy, bg_fx_q, bg_fx_step_q, vblend)),
+        Some(bg) => Some(blend_bg_row(ctx, bg, fy, walk.q(), last_q, vblend)),
     };
 
     // D_AA_ZOOM (opt-in): this function is only invoked when `!downscale`
@@ -1393,7 +1390,7 @@ fn zoom_row(
     // zoom (upscale in at least one axis), never on that native 1:1 case, so
     // gate on `fx_step`/`fy_step` directly rather than reusing `!downscale`.
     let mask_upscale =
-        ctx.opts.mask_aa && ctx.mask_shift == 0 && (fx_step < FRAC || fy_step < FRAC);
+        ctx.opts.mask_aa && ctx.mask_shift == 0 && (fx_step.grows() || fy_step.grows());
 
     // #963: on a native render the FG44 sample is a whole cell
     // ([`fg_native_frac`]: tx = ty = 0), where `sample_bilinear` returns
@@ -1416,7 +1413,7 @@ fn zoom_row(
         ($bg_at:expr) => {{
             let bg_at = $bg_at;
             for (ox, pixel) in row_buf.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let fx = (ox as u32 + ctx.offset_x) * fx_step;
+                let fx = fx_step.at(ox as u32 + ctx.offset_x);
                 let px = (fx >> FRACBITS).min(page_w.saturating_sub(1));
 
                 // `coverage` generalises the binary `is_fg` lookup to a 0..=255
@@ -1446,7 +1443,7 @@ fn zoom_row(
                 };
 
                 let (r, g, b) = if coverage == 0 {
-                    bg_at(ox, bg_fx_q)
+                    bg_at(ox, walk.q())
                 } else {
                     let (fr, fg_g, fb) = if let Some(pal) = ctx.fg_palette {
                         let color = lookup_palette_color(pal, ctx.blit_map, ctx.mask, px, py);
@@ -1465,7 +1462,7 @@ fn zoom_row(
                     } else {
                         // Partial coverage (mask_aa only): blend fg/bg proportionally
                         // to the interpolated mask coverage for a smoothed glyph edge.
-                        let (br, bg_g, bb) = bg_at(ox, bg_fx_q);
+                        let (br, bg_g, bb) = bg_at(ox, walk.q());
                         let cov = coverage as u32;
                         let inv = 255 - cov;
                         let blend = |f: u8, b: u8| -> u8 {
@@ -1486,7 +1483,7 @@ fn zoom_row(
                     pixel[2] = ctx.gamma_lut[b as usize];
                 }
                 pixel[3] = 255;
-                bg_fx_q = bg_fx_q.wrapping_add(bg_fx_step_q);
+                walk.advance();
             }
         }};
     }
@@ -1590,8 +1587,8 @@ fn blend_bg_row<'v>(
     ctx: &CompositeContext<'_>,
     bg: PlaneView<'_>,
     fy: u32,
-    bg_fx_q: u64,
-    bg_fx_step_q: u64,
+    first_q: u64,
+    last_q: u64,
     vblend: &'v mut Vec<u16>,
 ) -> BgRow<'v> {
     let bg_fy = map_plane_center_frac(fy, ctx.bg_y_q24);
@@ -1604,9 +1601,7 @@ fn blend_bg_row<'v>(
     let row1 = bg.row(y1);
     let clamp_w = bg.width().saturating_sub(1);
     let fx_at = |q: u64| ((q >> 24) as u32).saturating_sub(FRAC / 2);
-    let col_start = (fx_at(bg_fx_q) >> FRACBITS).min(clamp_w);
-    let last_q =
-        bg_fx_q.wrapping_add(bg_fx_step_q.wrapping_mul(ctx.out_w.saturating_sub(1) as u64));
+    let col_start = (fx_at(first_q) >> FRACBITS).min(clamp_w);
     let col_end = ((fx_at(last_q) >> FRACBITS).min(clamp_w) + 1).min(clamp_w);
     let ncols = (col_end - col_start + 1) as usize;
     vblend.clear();
@@ -1628,20 +1623,22 @@ fn blend_bg_row<'v>(
 
 /// Write one area-average row into `row_buf` (downscale).
 #[inline]
-#[allow(clippy::too_many_arguments)]
 pub(super) fn composite_rows_area_avg_one(
     ctx: &CompositeContext<'_>,
     oy: u32,
-    fx_step: u32,
-    fy_step: u32,
-    bg_fx_step: u32,
-    bg_fy_step: u32,
+    fx_step: Step,
+    fy_step: Step,
     row_buf: &mut [u8],
     area_avg_x: Option<&[AreaAvgX]>,
 ) {
-    let fy = (oy + ctx.offset_y) * fy_step;
+    // The row's footprint ends where the next row's starts.
+    let fy = fy_step.at(oy + ctx.offset_y);
+    let fy_end = fy_step.at(oy + ctx.offset_y + 1);
     let bg_fy = ((fy as u64 * ctx.bg_y_q24) >> 24) as u32;
-    let bg_y = ctx.bg.map(|bg| area_range(bg.height(), bg_fy, bg_fy_step));
+    let bg_fy_end = plane_end(fy_end, ctx.page_h, ctx.bg_y_q24);
+    let bg_y = ctx
+        .bg
+        .map(|bg| area_range(bg.height(), bg_fy, bg_fy_end - bg_fy));
 
     // #438: row-level all-bg fast path (F2/I3 analog for the area-avg path). The
     // mask footprint's y-band [y0, y1) is row-invariant; if it has no foreground
@@ -1668,7 +1665,7 @@ pub(super) fn composite_rows_area_avg_one(
         ctx.mask.is_none_or(|m| {
             let stride = m.row_stride();
             let y0 = (fy >> FRACBITS).min(m.height.saturating_sub(1)) as usize;
-            let y1 = ((fy + fy_step) >> FRACBITS).min(m.height) as usize;
+            let y1 = (fy_end >> FRACBITS).min(m.height) as usize;
             y1 <= y0 || !m.data[y0 * stride..y1 * stride].iter().any(|&b| b != 0)
         })
     } else {
@@ -1684,17 +1681,11 @@ pub(super) fn composite_rows_area_avg_one(
     };
 
     for (ox, pixel) in row_buf.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let fallback;
-        let ax = if let Some(ax) = area_avg_x.and_then(|xs| xs.get(ox)) {
-            *ax
-        } else {
-            let fx = (ox as u32 + ctx.offset_x) * fx_step;
-            let bg_fx = ((fx as u64 * ctx.bg_x_q24) >> 24) as u32;
-            let (bg_x0, bg_x1) = area_range(ctx.bg.map_or(0, |bg| bg.width()), bg_fx, bg_fx_step);
-            fallback = AreaAvgX { fx, bg_x0, bg_x1 };
-            fallback
+        let ax = match area_avg_x.and_then(|xs| xs.get(ox)) {
+            Some(ax) => *ax,
+            None => column_footprint(ctx, fx_step, ox as u32 + ctx.offset_x),
         };
-        let fx = ax.fx;
+        let (fx, fx_end) = (ax.fx, ax.fx_end);
 
         // #439: anti-aliased colour downscale. `coverage` (0..255) is the fraction
         // of the output pixel's footprint that is foreground; blend fg/bg
@@ -1713,7 +1704,7 @@ pub(super) fn composite_rows_area_avg_one(
                         .is_some_and(|row| (row[(px / 8) as usize] >> (7 - (px % 8))) & 1 == 1);
                 if set { 255 } else { 0 }
             } else {
-                mask_box_coverage(m, fx, fy, fx_step, fy_step)
+                mask_box_coverage(m, fx, fy, fx_end - fx, fy_end - fy)
             }
         } else {
             0
@@ -1739,15 +1730,16 @@ pub(super) fn composite_rows_area_avg_one(
         };
         let fg_sample = || -> (u8, u8, u8) {
             if let Some(pal) = ctx.fg_palette {
-                let (cx, cy) = mask_box_center_fg(ctx.mask.unwrap(), fx, fy, fx_step, fy_step);
+                let (cx, cy) =
+                    mask_box_center_fg(ctx.mask.unwrap(), fx, fy, fx_end - fx, fy_end - fy);
                 let color = lookup_palette_color(pal, ctx.blit_map, ctx.mask, cx, cy);
                 (color.r, color.g, color.b)
             } else if let Some(fg) = ctx.fg44 {
                 let fg_fx = ((fx as u64 * ctx.fg_x_q24) >> 24) as u32;
                 let fg_fy = ((fy as u64 * ctx.fg_y_q24) >> 24) as u32;
-                let fg_fx_step = ((fx_step as u64 * ctx.fg_x_q24) >> 24) as u32;
-                let fg_fy_step = ((fy_step as u64 * ctx.fg_y_q24) >> 24) as u32;
-                sample_area_avg(fg, fg_fx, fg_fy, fg_fx_step, fg_fy_step)
+                let fg_fx_end = plane_end(fx_end, ctx.page_w, ctx.fg_x_q24);
+                let fg_fy_end = plane_end(fy_end, ctx.page_h, ctx.fg_y_q24);
+                sample_area_avg(fg, fg_fx, fg_fy, fg_fx_end - fg_fx, fg_fy_end - fg_fy)
             } else {
                 (0, 0, 0)
             }

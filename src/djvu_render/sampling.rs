@@ -48,6 +48,119 @@ pub(super) const FRACBITS: u32 = 4;
 pub(super) const FRAC: u32 = 1 << FRACBITS;
 pub(super) const FRAC_MASK: u32 = FRAC - 1;
 
+/// Fraction bits a [`Step`] keeps beyond [`FRACBITS`].
+const STEP_EXTRA: u32 = 28;
+
+/// How one axis of the canvas maps onto the page: `page` source pixels spread
+/// over `full` output pixels.
+///
+/// Output pixel `o` covers source positions `o * page / full` up to where
+/// pixel `o + 1` starts. The step keeps [`STEP_EXTRA`] bits beyond
+/// [`FRACBITS`], rounded up, so a position lies past the exact one by less
+/// than `o / 2^32` of a source pixel before it is rounded down to `1 / FRAC`,
+/// and the last output pixel ends exactly at the page's edge. A step of
+/// [`FRACBITS`] bits alone is short by up to `1 / FRAC` of a source pixel per
+/// output pixel and moves the content by that much more with every output
+/// pixel from the origin: page 1 of `DjVu3Spec_bundled.djvu` at 1270 x 1648
+/// (a step just under 2) came out 51 rows too tall. A step that is a whole
+/// number of sixteenths, such as an exact half, never drifted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Step(u64);
+
+impl Step {
+    /// The step of `page` source pixels over `full` output pixels. A 16-bit
+    /// page side (INFO sizes are 16-bit) shifted by 32 bits stays far inside
+    /// `u64`.
+    pub(super) fn new(page: u32, full: u32) -> Self {
+        Self((u64::from(page) << (FRACBITS + STEP_EXTRA)).div_ceil(u64::from(full.max(1))))
+    }
+
+    /// Where output pixel `o` starts, in `1 / FRAC` source pixels; pixel `o`
+    /// ends where `o + 1` starts, so footprints tile the page without gaps,
+    /// and `at(full)` is the page's edge. For `o` up to `full` the product
+    /// stays below `(page + 1) << 32`.
+    #[inline(always)]
+    pub(super) fn at(self, o: u32) -> u32 {
+        ((u64::from(o) * self.0) >> STEP_EXTRA) as u32
+    }
+
+    /// One output pixel is one source pixel.
+    pub(super) fn is_identity(self) -> bool {
+        self.0 == u64::from(FRAC) << STEP_EXTRA
+    }
+
+    /// One output pixel covers more than one source pixel.
+    pub(super) fn shrinks(self) -> bool {
+        self.0 > u64::from(FRAC) << STEP_EXTRA
+    }
+
+    /// One output pixel covers less than one source pixel.
+    pub(super) fn grows(self) -> bool {
+        self.0 < u64::from(FRAC) << STEP_EXTRA
+    }
+
+    /// Output pixel `o`'s source position plus half a source pixel, mapped
+    /// onto a plane by `q24` (see `bg_q24`), in Q(`FRACBITS` + 24); the value
+    /// [`PlaneWalk::q`] has at that pixel.
+    pub(super) fn plane_q(self, o: u32, q24: u64) -> u64 {
+        PlaneWalk::new(self, o, q24).q()
+    }
+
+    /// About one output pixel mapped onto a plane by `q24`, in
+    /// Q(`FRACBITS` + 24), rounded down: how far a band must reach.
+    pub(super) fn plane_step_q(self, q24: u64) -> u64 {
+        ((u128::from(self.0) * u128::from(q24)) >> STEP_EXTRA) as u64
+    }
+}
+
+/// Where a footprint that ends at `end`, in `1 / FRAC` page pixels, ends on a
+/// plane that `q24` maps a `page`-pixel side onto. One that ends at the page's
+/// edge ends at the plane's: `q24` is rounded down, so the page's edge mapped
+/// through it would stop short of the plane's last pixel.
+#[inline(always)]
+pub(super) fn plane_end(end: u32, page: u32, q24: u64) -> u32 {
+    if end >= page << FRACBITS {
+        ((u64::from(page) * q24).div_ceil(1 << 24) << FRACBITS) as u32
+    } else {
+        ((u64::from(end) * q24) >> 24) as u32
+    }
+}
+
+/// A walk along a plane's columns, one output pixel at a time. It keeps the
+/// step's full precision, so a walk started at any pixel (a region, a tile)
+/// reaches the same plane coordinate there as one started at the row's first
+/// pixel. Background Q24 ratios are at most `2^24`, so the product stays far
+/// inside `u128`.
+#[derive(Clone, Copy)]
+pub(super) struct PlaneWalk {
+    at: u128,
+    by: u128,
+}
+
+impl PlaneWalk {
+    /// The walk from output pixel `o` over a plane mapped by `q24`.
+    pub(super) fn new(step: Step, o: u32, q24: u64) -> Self {
+        let pos = u128::from(step.0) * u128::from(o) + (u128::from(FRAC / 2) << STEP_EXTRA);
+        Self {
+            at: pos * u128::from(q24),
+            by: u128::from(step.0) * u128::from(q24),
+        }
+    }
+
+    /// The current pixel's source position plus half a source pixel, on the
+    /// plane, in Q(`FRACBITS` + 24).
+    #[inline(always)]
+    pub(super) fn q(self) -> u64 {
+        (self.at >> STEP_EXTRA) as u64
+    }
+
+    /// On to the next output pixel.
+    #[inline(always)]
+    pub(super) fn advance(&mut self) {
+        self.at += self.by;
+    }
+}
+
 /// Maps each byte value to 8 fg-mask bytes (MSB-first): 0xFF if bit set (fg), 0x00 otherwise.
 pub(super) const MASK_EXPAND: [[u8; 8]; 256] = {
     let mut lut = [[0u8; 8]; 256];
