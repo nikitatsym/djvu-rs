@@ -98,7 +98,7 @@ impl Clone for ChunkStore {
 /// (DjVu uses a zero-length chunk as a placeholder).  Callers receive already
 /// decoded bytes, so the format parsers stay pure `&[u8]` functions that never
 /// touch compression.
-pub(super) fn decode_paired_payload(
+pub(crate) fn decode_paired_payload(
     z: Option<&[u8]>,
     a: Option<&[u8]>,
 ) -> Result<Option<Vec<u8>>, BzzError> {
