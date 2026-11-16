@@ -53,12 +53,13 @@ use crate::{
     dirm::{DirmComponentKind, DirmPayload},
     djvu_document::{
         ComponentId, ComponentKind, ComponentResolveError, DjVuDocument, DjVuPage, DocError,
-        SharedDict, assembly::incl_targets,
+        SharedDict, assembly::incl_targets, decode_paired_payload,
     },
     djvu_render::{self, RenderError, RenderOptions},
     djvu_tile::{TileCancelToken, TileError, TileRenderControls},
     error::IffError,
     iff::{MAGIC, parse_form},
+    metadata::DjVuMetadata,
     pixmap::Pixmap,
 };
 
@@ -159,6 +160,9 @@ pub struct LazyDocument<R> {
     /// Shared components by DIRM name; `None` once read when the component
     /// holds no `Djbz` (for example shared annotations).
     shared_cache: BTreeMap<String, OnceCell<Option<Arc<SharedDict>>>>,
+    /// DIRM name of the shared-annotation component, which carries the
+    /// document's `(metadata …)` block.
+    shared_anno: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,8 +192,12 @@ where
 
         let form_type = &head[12..16];
         // A legacy FORM:BM44/PM44 image file is a one-page document too.
-        let (pages, shared) = if crate::dirm::is_page_form(form_type) {
-            (vec![LazyPageIndex { range: 0..file_len }], BTreeMap::new())
+        let (pages, shared, shared_anno) = if crate::dirm::is_page_form(form_type) {
+            (
+                vec![LazyPageIndex { range: 0..file_len }],
+                BTreeMap::new(),
+                None,
+            )
         } else if form_type == b"DJVM" {
             index_bundled_djvm(&mut reader).await?
         } else {
@@ -215,7 +223,34 @@ where
             shared,
             cache,
             shared_cache,
+            shared_anno,
         })
+    }
+
+    /// The document's metadata: the `(metadata …)` block of its
+    /// shared-annotation component, or of a single page's own annotation;
+    /// `None` when neither states any. A root `METz`/`METa` chunk, which only
+    /// early djvu-rs versions wrote, is not read here (see
+    /// [`DjVuDocument::metadata`]).
+    pub async fn metadata_async(&self) -> Result<Option<DjVuMetadata>, AsyncLazyError> {
+        let range = match (&self.shared_anno, self.pages.as_slice()) {
+            (Some(name), _) => match self.shared.get(name) {
+                Some(component) => component.range.clone(),
+                None => return Ok(None),
+            },
+            (None, [single]) if single.range.start == 0 => single.range.clone(),
+            _ => return Ok(None),
+        };
+        let bytes = self.read_page_bytes(range).await?;
+        let form = parse_form(&bytes)?;
+        let find = |id: &[u8; 4]| form.chunks.iter().find(|c| &c.id == id).map(|c| c.data);
+        let Some(text) =
+            decode_paired_payload(find(b"ANTz"), find(b"ANTa")).map_err(DocError::from)?
+        else {
+            return Ok(None);
+        };
+        let meta = crate::metadata::parse_metadata(&text).map_err(DocError::from)?;
+        Ok((meta != DjVuMetadata::default()).then_some(meta))
     }
 
     /// Number of lazy-loadable pages.
@@ -525,7 +560,14 @@ where
 
 async fn index_bundled_djvm<R>(
     reader: &mut R,
-) -> Result<(Vec<LazyPageIndex>, BTreeMap<String, LazyComponentIndex>), AsyncLazyError>
+) -> Result<
+    (
+        Vec<LazyPageIndex>,
+        BTreeMap<String, LazyComponentIndex>,
+        Option<String>,
+    ),
+    AsyncLazyError,
+>
 where
     R: AsyncRead + AsyncSeek + Unpin + 'static,
 {
@@ -545,6 +587,7 @@ where
     let entries = parse_lazy_dirm(&dirm[..dirm_len])?;
     let mut pages = Vec::new();
     let mut shared = BTreeMap::new();
+    let mut shared_anno = None;
     for entry in entries {
         // The DIRM size table gives each component's byte length (FORM header
         // included), so a populated table indexes the whole document from the
@@ -562,13 +605,17 @@ where
         };
         match entry.comp_type {
             DirmComponentKind::Page => pages.push(LazyPageIndex { range }),
-            DirmComponentKind::Shared | DirmComponentKind::SharedAnno => {
+            DirmComponentKind::Shared => {
+                shared.insert(entry.id, LazyComponentIndex { range });
+            }
+            DirmComponentKind::SharedAnno => {
+                shared_anno = Some(entry.id.clone());
                 shared.insert(entry.id, LazyComponentIndex { range });
             }
             DirmComponentKind::Thumbnail => {}
         }
     }
-    Ok((pages, shared))
+    Ok((pages, shared, shared_anno))
 }
 
 fn parse_lazy_dirm(data: &[u8]) -> Result<Vec<LazyDirmEntry>, AsyncLazyError> {
@@ -1086,6 +1133,32 @@ mod tests {
             matches!(err, AsyncLazyError::Parse(_)),
             "expected Parse error, got {err:?}"
         );
+    }
+
+    /// A lazily opened document gives the metadata its shared annotation
+    /// states, as the whole parsed one does; a document without any gives
+    /// none.
+    #[tokio::test]
+    async fn lazy_document_metadata_matches_sync() {
+        let original = std::fs::read(assets_path().join("navm_fgbz.djvu")).expect("read");
+        let mut edit = crate::djvu_mut::DjVuDocumentMut::from_bytes(&original).expect("edit");
+        let meta = crate::metadata::DjVuMetadata {
+            title: Some("Navigation".into()),
+            author: Some("An Author".into()),
+            ..Default::default()
+        };
+        edit.set_metadata(&meta).expect("set metadata");
+        let bytes = edit.into_bytes();
+        let lazy = from_async_reader_lazy(std::io::Cursor::new(bytes))
+            .await
+            .expect("lazy index");
+        assert_eq!(lazy.metadata_async().await.expect("metadata"), Some(meta));
+
+        let plain = std::fs::read(assets_path().join("chicken.djvu")).expect("read");
+        let lazy = from_async_reader_lazy(std::io::Cursor::new(plain))
+            .await
+            .expect("lazy index");
+        assert_eq!(lazy.metadata_async().await.expect("metadata"), None);
     }
 
     /// `LazyDocument` fetches and parses a single-page document only when
