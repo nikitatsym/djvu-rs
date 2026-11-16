@@ -48,6 +48,136 @@ pub(super) const FRACBITS: u32 = 4;
 pub(super) const FRAC: u32 = 1 << FRACBITS;
 pub(super) const FRAC_MASK: u32 = FRAC - 1;
 
+/// Fraction bits a [`Step`] keeps beyond [`FRACBITS`].
+const STEP_EXTRA: u32 = 28;
+
+/// Source pixels per output pixel on one axis; 28 extra bits, as sixteenths drifted 51 rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Step(u64);
+
+impl Step {
+    /// Rounded up, so the last output pixel ends exactly at the page's edge.
+    pub(super) fn new(page: u32, full: u32) -> Self {
+        Self((u64::from(page) << (FRACBITS + STEP_EXTRA)).div_ceil(u64::from(full.max(1))))
+    }
+
+    /// Where output pixel `o` starts, in `1 / FRAC` source pixels.
+    #[inline(always)]
+    pub(super) fn at(self, o: u32) -> u32 {
+        ((u64::from(o) * self.0) >> STEP_EXTRA) as u32
+    }
+
+    /// The same starts with an add per pixel instead of a multiply.
+    #[inline(always)]
+    pub(super) fn starting_at(self, o: u32) -> Positions {
+        Positions {
+            at: u64::from(o) * self.0,
+            by: self.0,
+        }
+    }
+
+    /// One output pixel is one source pixel.
+    pub(super) fn is_identity(self) -> bool {
+        self.0 == u64::from(FRAC) << STEP_EXTRA
+    }
+
+    /// One output pixel covers more than one source pixel.
+    pub(super) fn shrinks(self) -> bool {
+        self.0 > u64::from(FRAC) << STEP_EXTRA
+    }
+
+    /// One output pixel covers less than one source pixel.
+    pub(super) fn grows(self) -> bool {
+        self.0 < u64::from(FRAC) << STEP_EXTRA
+    }
+
+    /// Output pixel `o`'s centre on a plane mapped by `q24`, in Q(`FRACBITS` + 24).
+    pub(super) fn plane_q(self, o: u32, q24: u64) -> u64 {
+        PlaneWalk::new(self, o, q24).q()
+    }
+
+    /// One output pixel on a plane mapped by `q24`, rounded down: how far a band must reach.
+    pub(super) fn plane_step_q(self, q24: u64) -> u64 {
+        ((u128::from(self.0) * u128::from(q24)) >> STEP_EXTRA) as u64
+    }
+}
+
+/// The starts of successive output pixels.
+#[derive(Clone, Copy)]
+pub(super) struct Positions {
+    at: u64,
+    by: u64,
+}
+
+impl Iterator for Positions {
+    type Item = Column;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Column> {
+        let column = Column(self.at);
+        self.at += self.by;
+        Some(column)
+    }
+}
+
+/// Where an output pixel starts on the page, kept with [`Step`]'s precision.
+#[derive(Clone, Copy)]
+pub(super) struct Column(u64);
+
+impl Column {
+    /// The start, in `1 / FRAC` source pixels: [`Step::at`] of the pixel.
+    #[inline(always)]
+    pub(super) fn start(self) -> u32 {
+        (self.0 >> STEP_EXTRA) as u32
+    }
+
+    /// The source pixel it starts in, with one shift.
+    #[inline(always)]
+    pub(super) fn pixel(self) -> u32 {
+        (self.0 >> (STEP_EXTRA + FRACBITS)) as u32
+    }
+}
+
+/// Where a footprint ending at `end` ends on a plane; the page's edge maps to the plane's.
+#[inline(always)]
+pub(super) fn plane_end(end: u32, page: u32, q24: u64) -> u32 {
+    if end >= page << FRACBITS {
+        ((u64::from(page) * q24).div_ceil(1 << 24) << FRACBITS) as u32
+    } else {
+        ((u64::from(end) * q24) >> 24) as u32
+    }
+}
+
+/// A plane column walk at full precision, so it agrees from any starting pixel.
+#[derive(Clone, Copy)]
+pub(super) struct PlaneWalk {
+    at: u128,
+    by: u128,
+}
+
+impl PlaneWalk {
+    /// The walk from output pixel `o` over a plane mapped by `q24`.
+    pub(super) fn new(step: Step, o: u32, q24: u64) -> Self {
+        let pos = u128::from(step.0) * u128::from(o) + (u128::from(FRAC / 2) << STEP_EXTRA);
+        Self {
+            at: pos * u128::from(q24),
+            by: u128::from(step.0) * u128::from(q24),
+        }
+    }
+
+    /// The current pixel's centre on the plane, in Q(`FRACBITS` + 24).
+    #[inline(always)]
+    pub(super) fn q(self) -> u64 {
+        (self.at >> STEP_EXTRA) as u64
+    }
+
+    /// On to the next output pixel.
+    #[inline(always)]
+    pub(super) fn advance(&mut self) {
+        self.at += self.by;
+    }
+}
+
 /// Maps each byte value to 8 fg-mask bytes (MSB-first): 0xFF if bit set (fg), 0x00 otherwise.
 pub(super) const MASK_EXPAND: [[u8; 8]; 256] = {
     let mut lut = [[0u8; 8]; 256];
@@ -514,10 +644,8 @@ pub(super) fn mask_box_coverage(
     fx_step: u32,
     fy_step: u32,
 ) -> u8 {
-    let x0 = (fx >> FRACBITS).min(mask.width.saturating_sub(1));
-    let y0 = (fy >> FRACBITS).min(mask.height.saturating_sub(1));
-    let x1 = ((fx + fx_step) >> FRACBITS).min(mask.width);
-    let y1 = ((fy + fy_step) >> FRACBITS).min(mask.height);
+    let (x0, x1) = area_range(mask.width, fx, fx_step);
+    let (y0, y1) = area_range(mask.height, fy, fy_step);
     let total = (x1 - x0) * (y1 - y0);
     if total == 0 {
         return 0;

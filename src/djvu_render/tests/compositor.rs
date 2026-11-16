@@ -79,7 +79,7 @@ fn composite_bilevel_one_maps_mask_to_black_and_white() {
     let ctx = synth_ctx(&opts, 8, 1, None, Some(&mask), &lut, 8, 1);
 
     let mut row = vec![0u8; 8 * 4];
-    composite_rows_bilevel_one(&ctx, 0, FRAC, FRAC, &mut row);
+    composite_rows_bilevel_one(&ctx, 0, Step::new(1, 1), Step::new(1, 1), &mut row);
 
     for x in 0..8usize {
         let p = &row[x * 4..x * 4 + 4];
@@ -104,7 +104,8 @@ fn composite_bilinear_one_copies_background_1to1_unsubsampled() {
     let ctx = synth_ctx(&opts, 4, 2, Some(&bg), Some(&mask), &lut, 4, 2);
 
     let mut row = vec![0u8; 4 * 4];
-    composite_rows_bilinear_one(&ctx, 0, FRAC, FRAC, &mut row, None, &mut Vec::new());
+    let one = Step::new(1, 1);
+    composite_rows_bilinear_one(&ctx, 0, one, one, &mut row, None, &mut Vec::new());
 
     for x in 0..4usize {
         let p = &row[x * 4..x * 4 + 4];
@@ -133,7 +134,8 @@ fn composite_bilinear_one_upsamples_subsampled_background() {
     );
 
     let mut row = vec![0u8; 8 * 4];
-    composite_rows_bilinear_one(&ctx, 0, FRAC, FRAC, &mut row, None, &mut Vec::new());
+    let one = Step::new(1, 1);
+    composite_rows_bilinear_one(&ctx, 0, one, one, &mut row, None, &mut Vec::new());
 
     for x in 0..8usize {
         let p = &row[x * 4..x * 4 + 4];
@@ -152,23 +154,12 @@ fn composite_area_avg_one_averages_uniform_background_on_downscale() {
     let lut = identity_lut();
     let ctx = synth_ctx(&opts, 4, 2, Some(&bg), Some(&mask), &lut, 2, 1);
 
-    let fx_step = 2 * FRAC;
-    let fy_step = 2 * FRAC;
-    let bg_fx_step = ((fx_step as u64 * ctx.bg_x_q24) >> 24) as u32;
-    let bg_fy_step = ((fy_step as u64 * ctx.bg_y_q24) >> 24) as u32;
-    let xs = precompute_area_avg_x(&ctx, fx_step, bg_fx_step);
+    let fx_step = Step::new(2, 1);
+    let fy_step = Step::new(2, 1);
+    let xs = precompute_area_avg_x(&ctx, fx_step);
 
     let mut row = vec![0u8; 2 * 4];
-    composite_rows_area_avg_one(
-        &ctx,
-        0,
-        fx_step,
-        fy_step,
-        bg_fx_step,
-        bg_fy_step,
-        &mut row,
-        Some(&xs),
-    );
+    composite_rows_area_avg_one(&ctx, 0, fx_step, fy_step, &mut row, Some(&xs));
 
     for x in 0..2usize {
         let p = &row[x * 4..x * 4 + 4];
@@ -392,4 +383,253 @@ fn fg_native_row_matches_whole_cell_bilinear() {
     let short = FgNativeRow::new(&[1, 2, 3, 4, 5, 6], 4, 1);
     assert_eq!(short.at(0), (1, 2, 3));
     assert_eq!(short.at(1), (0, 0, 0));
+}
+
+/// The output column of the darkest pixel of a one-row composite.
+fn darkest_column(ctx: &CompositeContext<'_>) -> usize {
+    let mut row = vec![0u8; ctx.out_w as usize * 4];
+    composite_into(ctx, &mut row).unwrap();
+    let luma = |px: &[u8]| u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2]);
+    (0..ctx.out_w as usize)
+        .min_by_key(|&x| luma(&row[x * 4..x * 4 + 4]))
+        .unwrap()
+}
+
+/// Steps no whole number of sixteenths: truncated, they put the column 38 and 60 off.
+#[test]
+fn scaled_composites_keep_page_columns_in_place() {
+    let lut = identity_lut();
+    for (page_w, out_w, dark) in [(2539u32, 1270u32, 2400u32), (1000, 1030, 900)] {
+        let expected = (dark as usize * out_w as usize) / page_w as usize;
+        let opts = RenderOptions {
+            width: out_w,
+            height: 1,
+            ..RenderOptions::default()
+        };
+        let mut bg = Pixmap::white(page_w, 1);
+        bg.set_rgb(dark, 0, 0, 0, 0);
+        bg.set_rgb(dark + 1, 0, 0, 0, 0);
+        let ctx = synth_ctx(&opts, page_w, 1, Some(&bg), None, &lut, out_w, 1);
+        let got = darkest_column(&ctx);
+        assert!(
+            got.abs_diff(expected) <= 1,
+            "background {page_w} -> {out_w}: column {dark} at {got}, expected {expected}"
+        );
+        let mut mask = crate::bitmap::Bitmap::new(page_w, 1);
+        mask.set_black(dark, 0);
+        mask.set_black(dark + 1, 0);
+        let ctx = synth_ctx(&opts, page_w, 1, None, Some(&mask), &lut, out_w, 1);
+        let got = darkest_column(&ctx);
+        assert!(
+            got.abs_diff(expected) <= 1,
+            "mask {page_w} -> {out_w}: column {dark} at {got}, expected {expected}"
+        );
+    }
+}
+
+/// A single black source column or row stays visible after a downscale.
+#[test]
+fn downscale_keeps_a_single_source_column_and_row() {
+    let lut = identity_lut();
+    for (page, out, dark) in [(26u32, 19u32, 14u32), (2539, 1270, 2382)] {
+        let expected = (dark as usize * out as usize) / page as usize;
+        for across in [true, false] {
+            let (page_w, page_h, out_w, out_h) = if across {
+                (page, 1, out, 1)
+            } else {
+                (1, page, 1, out)
+            };
+            let opts = RenderOptions {
+                width: out_w,
+                height: out_h,
+                ..RenderOptions::default()
+            };
+            let (x, y) = if across { (dark, 0) } else { (0, dark) };
+            let mut bg = Pixmap::white(page_w, page_h);
+            bg.set_rgb(x, y, 0, 0, 0);
+            let mut mask = crate::bitmap::Bitmap::new(page_w, page_h);
+            mask.set_black(x, y);
+            for (layer, ctx) in [
+                (
+                    "background",
+                    synth_ctx(&opts, page_w, page_h, Some(&bg), None, &lut, out_w, out_h),
+                ),
+                (
+                    "mask",
+                    synth_ctx(&opts, page_w, page_h, None, Some(&mask), &lut, out_w, out_h),
+                ),
+            ] {
+                let mut buf = vec![0u8; (out_w * out_h) as usize * 4];
+                composite_into(&ctx, &mut buf).unwrap();
+                let darkest = buf
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, px)| u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2]))
+                    .map(|(i, px)| (i, px[0]));
+                assert!(
+                    darkest.is_some_and(|(i, value)| value < 255 && i.abs_diff(expected) <= 1),
+                    "{layer} {page} -> {out} {}: source {dark} gives {darkest:?}, expected near {expected}",
+                    if across { "across" } else { "down" },
+                );
+            }
+        }
+    }
+}
+
+/// The last footprint ends at the page's edge, so the last column and row are read.
+#[test]
+fn downscale_keeps_the_last_source_column_and_row() {
+    let lut = identity_lut();
+    for (page, out) in [(26u32, 19u32), (27, 19), (2539, 1270)] {
+        let third = page.div_ceil(3);
+        for across in [true, false] {
+            let along = |extent: u32| if across { (extent, 1) } else { (1, extent) };
+            let at = |i: u32| if across { (i, 0) } else { (0, i) };
+            let ((page_w, page_h), (out_w, out_h)) = (along(page), along(out));
+            let opts = RenderOptions {
+                width: out_w,
+                height: out_h,
+                ..RenderOptions::default()
+            };
+            let (x, y) = at(page - 1);
+            let mut bg = Pixmap::white(page_w, page_h);
+            bg.set_rgb(x, y, 0, 0, 0);
+            let (third_w, third_h) = along(third);
+            let mut reduced = Pixmap::white(third_w, third_h);
+            let (rx, ry) = at(third - 1);
+            reduced.set_rgb(rx, ry, 0, 0, 0);
+            let mut mask = crate::bitmap::Bitmap::new(page_w, page_h);
+            mask.set_black(x, y);
+            let mut black = crate::bitmap::Bitmap::new(page_w, page_h);
+            for i in 0..page {
+                let (bx, by) = at(i);
+                black.set_black(bx, by);
+            }
+            let mut fg = synth_ctx(
+                &opts,
+                page_w,
+                page_h,
+                None,
+                Some(&black),
+                &lut,
+                out_w,
+                out_h,
+            );
+            fg.fg44 = Some(&bg);
+            (fg.fg_x_q24, fg.fg_y_q24) = fg_q24(Some(&bg), page_w, page_h);
+            for (layer, ctx) in [
+                (
+                    "background",
+                    synth_ctx(&opts, page_w, page_h, Some(&bg), None, &lut, out_w, out_h),
+                ),
+                (
+                    "background at a third",
+                    synth_ctx(
+                        &opts,
+                        page_w,
+                        page_h,
+                        Some(&reduced),
+                        None,
+                        &lut,
+                        out_w,
+                        out_h,
+                    ),
+                ),
+                (
+                    "mask",
+                    synth_ctx(&opts, page_w, page_h, None, Some(&mask), &lut, out_w, out_h),
+                ),
+                ("FG44", fg),
+            ] {
+                let mut buf = vec![0u8; (out_w * out_h) as usize * 4];
+                composite_into(&ctx, &mut buf).unwrap();
+                let last = &buf[buf.len() - 4..];
+                assert!(
+                    last[0] < 255,
+                    "{layer} {page} -> {out} {}: the last output pixel is {last:?}",
+                    if across { "across" } else { "down" },
+                );
+            }
+        }
+    }
+}
+
+/// A mixed scale (one axis shrinks, one grows) keeps a solid-black page black.
+#[test]
+fn mixed_scaling_reads_the_pixel_a_growing_footprint_lies_in() {
+    let lut = identity_lut();
+    for (page_w, page_h, out_w, out_h) in [
+        (34u32, 1u32, 33u32, 3u32),
+        (40, 1, 33, 3),
+        (1, 34, 3, 33),
+        (1, 40, 3, 33),
+    ] {
+        let opts = RenderOptions {
+            width: out_w,
+            height: out_h,
+            ..RenderOptions::default()
+        };
+        let mut bg = Pixmap::white(page_w, page_h);
+        let mut mask = crate::bitmap::Bitmap::new(page_w, page_h);
+        for y in 0..page_h {
+            for x in 0..page_w {
+                bg.set_rgb(x, y, 0, 0, 0);
+                mask.set_black(x, y);
+            }
+        }
+        for (layer, ctx) in [
+            (
+                "background",
+                synth_ctx(&opts, page_w, page_h, Some(&bg), None, &lut, out_w, out_h),
+            ),
+            (
+                "mask",
+                synth_ctx(&opts, page_w, page_h, None, Some(&mask), &lut, out_w, out_h),
+            ),
+        ] {
+            let mut buf = vec![255u8; (out_w * out_h) as usize * 4];
+            composite_into(&ctx, &mut buf).unwrap();
+            let not_black: Vec<usize> = buf
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .filter(|(_, px)| px[..3] != [0, 0, 0])
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                not_black.is_empty(),
+                "{layer} {page_w}x{page_h} -> {out_w}x{out_h}: pixels {not_black:?} are not black"
+            );
+        }
+    }
+}
+
+/// A ratio that is no power of two (page 577, background 97, output 1155) once broke region crops.
+#[test]
+fn upscaled_region_matches_the_whole_render() {
+    let lut = identity_lut();
+    let (page_w, out_w) = (577u32, 1155u32);
+    let opts = RenderOptions {
+        width: out_w,
+        height: 1,
+        ..RenderOptions::default()
+    };
+    let mut bg = Pixmap::white(97, 1);
+    for x in (0..97).step_by(2) {
+        bg.set_rgb(x, 0, 0, 0, 0);
+    }
+    let whole = synth_ctx(&opts, page_w, 1, Some(&bg), None, &lut, out_w, 1);
+    let mut row = vec![0u8; out_w as usize * 4];
+    composite_into(&whole, &mut row).unwrap();
+    for x in [1, 433, 866, 1154] {
+        let mut region = synth_ctx(&opts, page_w, 1, Some(&bg), None, &lut, 1, 1);
+        region.offset_x = x;
+        let mut px = [0u8; 4];
+        composite_into(&region, &mut px).unwrap();
+        let start = x as usize * 4;
+        assert_eq!(px.as_slice(), &row[start..start + 4], "pixel {x}");
+    }
 }
