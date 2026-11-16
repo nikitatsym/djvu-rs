@@ -83,6 +83,20 @@ fn render_progressive(
         .pixmap(page)
 }
 
+// ── Render cache budget ───────────────────────────────────────────────────────
+
+/// Bytes pages keep decoded for their next render (256 MiB unless set); returns bytes freed.
+#[wasm_bindgen]
+pub fn set_render_cache_budget(bytes: f64) -> f64 {
+    crate::render_cache::set_budget(bytes as usize) as f64
+}
+
+/// Bytes the page render caches retain now.
+#[wasm_bindgen]
+pub fn render_cache_bytes() -> f64 {
+    crate::render_cache::resident_bytes() as f64
+}
+
 // ── WasmPixmap — Rust-owned pixel buffer (#611) ──────────────────────────────
 
 /// A Rust-owned RGBA pixel buffer that stays alive as long as JS holds the
