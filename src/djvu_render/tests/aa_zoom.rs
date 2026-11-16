@@ -38,8 +38,8 @@ fn composite_bilevel_one_mask_aa_disabled_matches_nearest_at_upscale() {
     let lut = identity_lut();
     let ctx = synth_ctx(&opts, 4, 1, None, Some(&mask), &lut, 8, 2);
 
-    let fx_step = FRAC / 2; // 2× upscale
-    let fy_step = FRAC / 2;
+    let fx_step = Step::new(1, 2); // 2× upscale
+    let fy_step = Step::new(1, 2);
     let mut row = vec![0u8; 8 * 4];
     composite_rows_bilevel_one(&ctx, 0, fx_step, fy_step, &mut row);
 
@@ -71,8 +71,8 @@ fn composite_bilevel_one_mask_aa_enabled_smooths_edge_at_upscale() {
     let lut = identity_lut();
     let ctx = synth_ctx(&opts, 4, 1, None, Some(&mask), &lut, 8, 2);
 
-    let fx_step = FRAC / 2;
-    let fy_step = FRAC / 2;
+    let fx_step = Step::new(1, 2);
+    let fy_step = Step::new(1, 2);
     let mut row = vec![0u8; 8 * 4];
     composite_rows_bilevel_one(&ctx, 0, fx_step, fy_step, &mut row);
 
@@ -101,7 +101,7 @@ fn composite_bilevel_one_mask_aa_is_noop_at_native_scale() {
     let opts_off = RenderOptions::default();
     let ctx_off = synth_ctx(&opts_off, 4, 1, None, Some(&mask), &lut, 4, 1);
     let mut row_off = vec![0u8; 4 * 4];
-    composite_rows_bilevel_one(&ctx_off, 0, FRAC, FRAC, &mut row_off);
+    composite_rows_bilevel_one(&ctx_off, 0, Step::new(1, 1), Step::new(1, 1), &mut row_off);
 
     let opts_on = RenderOptions {
         mask_aa: true,
@@ -109,7 +109,7 @@ fn composite_bilevel_one_mask_aa_is_noop_at_native_scale() {
     };
     let ctx_on = synth_ctx(&opts_on, 4, 1, None, Some(&mask), &lut, 4, 1);
     let mut row_on = vec![0u8; 4 * 4];
-    composite_rows_bilevel_one(&ctx_on, 0, FRAC, FRAC, &mut row_on);
+    composite_rows_bilevel_one(&ctx_on, 0, Step::new(1, 1), Step::new(1, 1), &mut row_on);
 
     assert_eq!(row_off, row_on, "mask_aa must not affect native 1:1 scale");
 }
@@ -125,8 +125,8 @@ fn composite_bilevel_one_mask_aa_is_noop_at_downscale() {
     mask.set(3, 0, true);
     let lut = identity_lut();
 
-    let fx_step = 4 * FRAC; // 4× downscale
-    let fy_step = FRAC;
+    let fx_step = Step::new(4, 1); // 4× downscale
+    let fy_step = Step::new(1, 1);
 
     let opts_off = RenderOptions::default();
     let ctx_off = synth_ctx(&opts_off, 4, 1, None, Some(&mask), &lut, 1, 1);
@@ -157,8 +157,8 @@ fn composite_bilinear_one_mask_aa_disabled_matches_nearest_at_upscale() {
     let lut = identity_lut();
     let ctx = synth_ctx(&opts, 8, 1, Some(&bg), Some(&mask), &lut, 4, 1);
 
-    let fx_step = FRAC / 2; // 2× upscale
-    let fy_step = FRAC / 2;
+    let fx_step = Step::new(1, 2); // 2× upscale
+    let fy_step = Step::new(1, 2);
     let mut row = vec![0u8; 4 * 4];
     composite_rows_bilinear_one(&ctx, 0, fx_step, fy_step, &mut row, None, &mut Vec::new());
 
@@ -185,8 +185,8 @@ fn composite_bilinear_one_mask_aa_enabled_blends_fg_bg_at_upscale() {
     let lut = identity_lut();
     let ctx = synth_ctx(&opts, 8, 1, Some(&bg), Some(&mask), &lut, 4, 1);
 
-    let fx_step = FRAC / 2;
-    let fy_step = FRAC / 2;
+    let fx_step = Step::new(1, 2);
+    let fy_step = Step::new(1, 2);
     let mut row = vec![0u8; 4 * 4];
     composite_rows_bilinear_one(&ctx, 0, fx_step, fy_step, &mut row, None, &mut Vec::new());
 
@@ -207,8 +207,8 @@ fn composite_bilinear_one_mask_aa_enabled_blends_fg_bg_at_upscale() {
     assert_eq!(&row[12..16], [200, 150, 100, 255], "ox=3 background");
 }
 
-/// Subtle no-op case: an exact page-level 1:1 render (`fx_step == fy_step
-/// == FRAC`) whose *background* plane is internally subsampled still falls
+/// Subtle no-op case: an exact page-level 1:1 render (both steps the
+/// identity) whose *background* plane is internally subsampled still falls
 /// through to the general B-series loop (the "extra-tight" 1:1 fast path
 /// requires `bg_x_q24 == 1<<24`, which fails here) — but `mask_aa` must
 /// still be a no-op there because there is no genuine axis upscale.
@@ -227,7 +227,8 @@ fn composite_bilinear_one_mask_aa_is_noop_when_bg_subsampled_at_native_scale() {
         "test must exercise subsampled bg"
     );
     let mut row_off = vec![0u8; 8 * 4];
-    composite_rows_bilinear_one(&ctx_off, 0, FRAC, FRAC, &mut row_off, None, &mut Vec::new());
+    let one = Step::new(1, 1);
+    composite_rows_bilinear_one(&ctx_off, 0, one, one, &mut row_off, None, &mut Vec::new());
 
     let opts_on = RenderOptions {
         mask_aa: true,
@@ -235,7 +236,7 @@ fn composite_bilinear_one_mask_aa_is_noop_when_bg_subsampled_at_native_scale() {
     };
     let ctx_on = synth_ctx(&opts_on, 8, 1, Some(&bg), Some(&mask), &lut, 8, 1);
     let mut row_on = vec![0u8; 8 * 4];
-    composite_rows_bilinear_one(&ctx_on, 0, FRAC, FRAC, &mut row_on, None, &mut Vec::new());
+    composite_rows_bilinear_one(&ctx_on, 0, one, one, &mut row_on, None, &mut Vec::new());
 
     assert_eq!(
         row_off, row_on,
@@ -262,8 +263,8 @@ fn composite_bilinear_one_column_table_matches_fallback() {
     let mut ctx = synth_ctx(&opts, 8, 2, Some(&bg), Some(&mask), &lut, 16, 4);
     ctx.offset_x = 3;
 
-    let fx_step = FRAC / 2; // 2× upscale
-    let fy_step = FRAC / 2;
+    let fx_step = Step::new(1, 2); // 2× upscale
+    let fy_step = Step::new(1, 2);
     let table = precompute_bilinear_x(&ctx, fx_step).expect("bg present");
 
     for oy in 0..4 {
