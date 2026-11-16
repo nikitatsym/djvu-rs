@@ -335,6 +335,19 @@ fn render_pixmap_still_works_after_refactor() {
     assert_eq!(pm.data.len(), 80 * 60 * 4);
 }
 
+/// A background stored at a third of the page (carte.djvu: 1400x852 for a
+/// 4200x2556 page) is subsampled for its own resolution, not the page's: a
+/// half-size render reads the whole plane, a sixth-size one a half of it.
+#[test]
+fn background_subsample_follows_the_stored_plane() {
+    let doc = load_doc("carte.djvu");
+    let page = doc.page(0).unwrap();
+    assert_eq!(background_subsample(page, 0.5), 1);
+    assert_eq!(background_subsample(page, 1.0 / 6.0), 2);
+    let full = load_doc("chicken.djvu");
+    assert_eq!(background_subsample(full.page(0).unwrap(), 0.5), 2);
+}
+
 /// `best_iw44_subsample` returns expected power-of-2 values.
 #[test]
 fn best_iw44_subsample_values() {
