@@ -393,3 +393,104 @@ fn fg_native_row_matches_whole_cell_bilinear() {
     assert_eq!(short.at(0), (1, 2, 3));
     assert_eq!(short.at(1), (0, 0, 0));
 }
+
+/// Page 31 -> 16 over a half-size background: flooring shifted it a pixel right and down.
+#[test]
+fn downscale_reads_the_background_pixels_under_the_footprint() {
+    let lut = identity_lut();
+    for across in [true, false] {
+        let along = |n: u32| if across { (n, 1) } else { (1, n) };
+        let ((page_w, page_h), (out_w, out_h), (bg_w, bg_h)) = (along(31), along(16), along(16));
+        let opts = RenderOptions {
+            width: out_w,
+            height: out_h,
+            ..RenderOptions::default()
+        };
+        let mut bg = Pixmap::white(bg_w, bg_h);
+        let (x, y) = if across { (10, 0) } else { (0, 10) };
+        bg.set_rgb(x, y, 0, 0, 0);
+        let ctx = synth_ctx(&opts, page_w, page_h, Some(&bg), None, &lut, out_w, out_h);
+        let mut buf = vec![0u8; (out_w * out_h) as usize * 4];
+        composite_into(&ctx, &mut buf).unwrap();
+        let dark: Vec<usize> = buf
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, px)| px[0] < 128)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            dark,
+            vec![10],
+            "{}: the dark output pixels",
+            if across { "across" } else { "down" }
+        );
+    }
+}
+
+/// Page 5 -> 3, plane 3 wide: the last footprint holds no centre and is nearer cell 2.
+#[test]
+fn downscale_without_a_covered_centre_reads_the_nearest_pixel() {
+    let lut = identity_lut();
+    for across in [true, false] {
+        let along = |n: u32| if across { (n, 1) } else { (1, n) };
+        let ((page_w, page_h), (out_w, out_h), (plane_w, plane_h)) = (along(5), along(3), along(3));
+        let opts = RenderOptions {
+            width: out_w,
+            height: out_h,
+            ..RenderOptions::default()
+        };
+        let mut plane = Pixmap::white(plane_w, plane_h);
+        let (mx, my) = if across { (1, 0) } else { (0, 1) };
+        plane.set_rgb(mx, my, 0, 0, 0);
+        let mut black = crate::bitmap::Bitmap::new(page_w, page_h);
+        for i in 0..5 {
+            let (x, y) = if across { (i, 0) } else { (0, i) };
+            black.set_black(x, y);
+        }
+        let mut fg = synth_ctx(
+            &opts,
+            page_w,
+            page_h,
+            None,
+            Some(&black),
+            &lut,
+            out_w,
+            out_h,
+        );
+        fg.fg44 = Some(&plane);
+        (fg.fg_x_q24, fg.fg_y_q24) = fg_q24(Some(&plane), page_w, page_h);
+        for (layer, ctx) in [
+            (
+                "background",
+                synth_ctx(
+                    &opts,
+                    page_w,
+                    page_h,
+                    Some(&plane),
+                    None,
+                    &lut,
+                    out_w,
+                    out_h,
+                ),
+            ),
+            ("FG44", fg),
+        ] {
+            let mut buf = vec![0u8; 3 * 4];
+            composite_into(&ctx, &mut buf).unwrap();
+            let dark: Vec<bool> = buf
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|px| px[0] < 128)
+                .collect();
+            assert_eq!(
+                dark,
+                vec![false, true, false],
+                "{layer} {}: the dark output pixels",
+                if across { "across" } else { "down" }
+            );
+        }
+    }
+}

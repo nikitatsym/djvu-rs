@@ -77,16 +77,22 @@ pub(super) struct AreaAvgX {
     pub(super) fx: u32,
     pub(super) bg_x0: u32,
     pub(super) bg_x1: u32,
+    /// The FG44 plane's columns `[fg_x0, fg_x1)`; empty without FG44.
+    pub(super) fg_x0: u32,
+    pub(super) fg_x1: u32,
 }
 
-// Exclusive upper bounds: the output pixel covers source [x0, x1) x [y0, y1).
-// The old inclusive formula gave a 3x3 box at 2x downscale because x1 landed on
-// the first pixel of the next output cell; exclusive gives the correct 2x2.
+// Pixels whose centres the footprint holds, else the nearest; flooring read the left one.
 pub(super) fn area_range(limit: u32, f: u32, step: u32) -> (u32, u32) {
-    (
-        (f >> FRACBITS).min(limit.saturating_sub(1)),
-        ((f + step) >> FRACBITS).min(limit),
-    )
+    let last = limit.saturating_sub(1);
+    let x0 = (f + FRAC / 2 - 1) >> FRACBITS;
+    let x1 = (f + step + FRAC / 2 - 1) >> FRACBITS;
+    if x1 > x0 {
+        (x0.min(last), x1.min(limit))
+    } else {
+        let nearest = ((f + step / 2) >> FRACBITS).min(last);
+        (nearest, (nearest + 1).min(limit))
+    }
 }
 
 pub(super) fn precompute_area_avg_x(
@@ -94,15 +100,29 @@ pub(super) fn precompute_area_avg_x(
     fx_step: u32,
     bg_fx_step: u32,
 ) -> Vec<AreaAvgX> {
-    let mut xs = Vec::with_capacity(ctx.out_w as usize);
-    let bg_w = ctx.bg.map_or(0, |bg| bg.width());
-    for ox in 0..ctx.out_w {
-        let fx = (ox + ctx.offset_x) * fx_step;
-        let bg_fx = ((fx as u64 * ctx.bg_x_q24) >> 24) as u32;
-        let (bg_x0, bg_x1) = area_range(bg_w, bg_fx, bg_fx_step);
-        xs.push(AreaAvgX { fx, bg_x0, bg_x1 });
+    (0..ctx.out_w)
+        .map(|ox| area_avg_column(ctx, fx_step, bg_fx_step, ox + ctx.offset_x))
+        .collect()
+}
+
+/// A column's ranges are the same on every row, so they are worked out once per render.
+#[inline]
+fn area_avg_column(ctx: &CompositeContext<'_>, fx_step: u32, bg_fx_step: u32, x: u32) -> AreaAvgX {
+    let fx = x * fx_step;
+    let bg_fx = ((fx as u64 * ctx.bg_x_q24) >> 24) as u32;
+    let (bg_x0, bg_x1) = area_range(ctx.bg.map_or(0, |bg| bg.width()), bg_fx, bg_fx_step);
+    let (fg_x0, fg_x1) = ctx.fg44.map_or((0, 0), |fg| {
+        let fg_fx = ((fx as u64 * ctx.fg_x_q24) >> 24) as u32;
+        let fg_fx_step = ((fx_step as u64 * ctx.fg_x_q24) >> 24) as u32;
+        area_range(fg.width, fg_fx, fg_fx_step)
+    });
+    AreaAvgX {
+        fx,
+        bg_x0,
+        bg_x1,
+        fg_x0,
+        fg_x1,
     }
-    xs
 }
 
 /// Per-output-column bg sampling data for the bilinear (upscale / 1:1) path:
@@ -1642,6 +1662,11 @@ pub(super) fn composite_rows_area_avg_one(
     let fy = (oy + ctx.offset_y) * fy_step;
     let bg_fy = ((fy as u64 * ctx.bg_y_q24) >> 24) as u32;
     let bg_y = ctx.bg.map(|bg| area_range(bg.height(), bg_fy, bg_fy_step));
+    let fg_y = ctx.fg44.map_or((0, 0), |fg| {
+        let fg_fy = ((fy as u64 * ctx.fg_y_q24) >> 24) as u32;
+        let fg_fy_step = ((fy_step as u64 * ctx.fg_y_q24) >> 24) as u32;
+        area_range(fg.height, fg_fy, fg_fy_step)
+    });
 
     // #438: row-level all-bg fast path (F2/I3 analog for the area-avg path). The
     // mask footprint's y-band [y0, y1) is row-invariant; if it has no foreground
@@ -1683,17 +1708,51 @@ pub(super) fn composite_rows_area_avg_one(
         _ => None,
     };
 
-    for (ox, pixel) in row_buf.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let fallback;
-        let ax = if let Some(ax) = area_avg_x.and_then(|xs| xs.get(ox)) {
-            *ax
+    let column = |ox: usize| match area_avg_x.and_then(|xs| xs.get(ox)) {
+        Some(ax) => *ax,
+        None => area_avg_column(ctx, fx_step, bg_fx_step, ox as u32 + ctx.offset_x),
+    };
+    let bg_sample = |ax: &AreaAvgX| -> (u8, u8, u8) {
+        // `bg_y` is `Some` exactly when `ctx.bg` is.
+        if let Some(row) = bg_row1
+            && ax.bg_x1 - ax.bg_x0 <= 1
+        {
+            // `sample_area_avg_bounds`'s 1x1 fast path on the hoisted row.
+            let off = ax.bg_x0 as usize * 4;
+            return row
+                .get(off..off + 4)
+                .map_or((0, 0, 0), |q| (q[0], q[1], q[2]));
+        }
+        match (ctx.bg, bg_y) {
+            (Some(bg), Some((bg_y0, bg_y1))) => {
+                sample_area_avg_bounds(bg, ax.bg_x0, ax.bg_x1, bg_y0, bg_y1)
+            }
+            _ => (255, 255, 255),
+        }
+    };
+    let put = |pixel: &mut [u8; 4], (r, g, b): (u8, u8, u8)| {
+        if ctx.gamma_is_identity {
+            pixel[0] = r;
+            pixel[1] = g;
+            pixel[2] = b;
         } else {
-            let fx = (ox as u32 + ctx.offset_x) * fx_step;
-            let bg_fx = ((fx as u64 * ctx.bg_x_q24) >> 24) as u32;
-            let (bg_x0, bg_x1) = area_range(ctx.bg.map_or(0, |bg| bg.width()), bg_fx, bg_fx_step);
-            fallback = AreaAvgX { fx, bg_x0, bg_x1 };
-            fallback
-        };
+            pixel[0] = ctx.gamma_lut[r as usize];
+            pixel[1] = ctx.gamma_lut[g as usize];
+            pixel[2] = ctx.gamma_lut[b as usize];
+        }
+        pixel[3] = 255;
+    };
+
+    // A row whose band holds no foreground is background only (#438).
+    if mask_all_bg {
+        for (ox, pixel) in row_buf.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            put(pixel, bg_sample(&column(ox)));
+        }
+        return;
+    }
+
+    for (ox, pixel) in row_buf.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let ax = column(ox);
         let fx = ax.fx;
 
         // #439: anti-aliased colour downscale. `coverage` (0..255) is the fraction
@@ -1701,10 +1760,8 @@ pub(super) fn composite_rows_area_avg_one(
         // proportionally so colour text edges get a smooth gradient instead of the
         // blocky halos the old binary `mask_box_any` produced (colour analog of the
         // AA experiment for bilevel). The max-pool sub-path (mask_shift > 0) stays
-        // binary. #438's `mask_all_bg` skips the coverage scan for blank rows.
-        let coverage: u8 = if mask_all_bg {
-            0
-        } else if let Some(m) = ctx.mask {
+        // binary.
+        let coverage: u8 = if let Some(m) = ctx.mask {
             if ctx.mask_shift > 0 {
                 // Same bit as `m.get(px, pym)`; `shifted_row` is that row.
                 let px = fx >> (FRACBITS + ctx.mask_shift);
@@ -1719,63 +1776,31 @@ pub(super) fn composite_rows_area_avg_one(
             0
         };
 
-        let bg_sample = || -> (u8, u8, u8) {
-            // `bg_y` is `Some` exactly when `ctx.bg` is.
-            if let Some(row) = bg_row1
-                && ax.bg_x1 - ax.bg_x0 <= 1
-            {
-                // `sample_area_avg_bounds`'s 1x1 fast path on the hoisted row.
-                let off = ax.bg_x0 as usize * 4;
-                return row
-                    .get(off..off + 4)
-                    .map_or((0, 0, 0), |q| (q[0], q[1], q[2]));
-            }
-            match (ctx.bg, bg_y) {
-                (Some(bg), Some((bg_y0, bg_y1))) => {
-                    sample_area_avg_bounds(bg, ax.bg_x0, ax.bg_x1, bg_y0, bg_y1)
-                }
-                _ => (255, 255, 255),
-            }
-        };
         let fg_sample = || -> (u8, u8, u8) {
             if let Some(pal) = ctx.fg_palette {
                 let (cx, cy) = mask_box_center_fg(ctx.mask.unwrap(), fx, fy, fx_step, fy_step);
                 let color = lookup_palette_color(pal, ctx.blit_map, ctx.mask, cx, cy);
                 (color.r, color.g, color.b)
             } else if let Some(fg) = ctx.fg44 {
-                let fg_fx = ((fx as u64 * ctx.fg_x_q24) >> 24) as u32;
-                let fg_fy = ((fy as u64 * ctx.fg_y_q24) >> 24) as u32;
-                let fg_fx_step = ((fx_step as u64 * ctx.fg_x_q24) >> 24) as u32;
-                let fg_fy_step = ((fy_step as u64 * ctx.fg_y_q24) >> 24) as u32;
-                sample_area_avg(fg, fg_fx, fg_fy, fg_fx_step, fg_fy_step)
+                sample_area_avg_bounds(PlaneView::whole(fg), ax.fg_x0, ax.fg_x1, fg_y.0, fg_y.1)
             } else {
                 (0, 0, 0)
             }
         };
 
-        let (r, g, b) = if coverage == 0 {
-            bg_sample()
+        let rgb = if coverage == 0 {
+            bg_sample(&ax)
         } else if coverage == 255 {
             fg_sample()
         } else {
             // Partially covered edge pixel: blend fg over bg by coverage.
             let (fr, fg_, fb) = fg_sample();
-            let (br, bg_, bb) = bg_sample();
+            let (br, bg_, bb) = bg_sample(&ax);
             let c = coverage as u32;
             let ic = 255 - c;
             let mix = |f: u8, b: u8| ((c * f as u32 + ic * b as u32 + 127) / 255) as u8;
             (mix(fr, br), mix(fg_, bg_), mix(fb, bb))
         };
-
-        if ctx.gamma_is_identity {
-            pixel[0] = r;
-            pixel[1] = g;
-            pixel[2] = b;
-        } else {
-            pixel[0] = ctx.gamma_lut[r as usize];
-            pixel[1] = ctx.gamma_lut[g as usize];
-            pixel[2] = ctx.gamma_lut[b as usize];
-        }
-        pixel[3] = 255;
+        put(pixel, rgb);
     }
 }

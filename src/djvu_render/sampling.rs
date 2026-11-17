@@ -424,25 +424,7 @@ pub(super) fn sample_nearest(pm: &Pixmap, fx: u32, fy: u32) -> (u8, u8, u8) {
     pm.get_rgb(x, y)
 }
 
-/// Area-average (box filter) sample: average all source pixels covered by the
-/// output pixel's footprint.  Used when downscaling (scale < 1.0) for better
-/// anti-aliasing and fewer moire patterns than bilinear.
-///
-/// `fx`, `fy` are the top-left corner of the output pixel in fixed-point.
-/// `fx_step`, `fy_step` are the output pixel size in source coordinates.
-#[inline]
-pub(super) fn sample_area_avg(
-    pm: &Pixmap,
-    fx: u32,
-    fy: u32,
-    fx_step: u32,
-    fy_step: u32,
-) -> (u8, u8, u8) {
-    let (x0, x1) = area_range(pm.width, fx, fx_step);
-    let (y0, y1) = area_range(pm.height, fy, fy_step);
-    sample_area_avg_bounds(PlaneView::whole(pm), x0, x1, y0, y1)
-}
-
+/// Area average (box filter) of `[x0, x1) x [y0, y1)`, against moire on downscale.
 #[inline]
 pub(super) fn sample_area_avg_bounds(
     pm: PlaneView<'_>,
