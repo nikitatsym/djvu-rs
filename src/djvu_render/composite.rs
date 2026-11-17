@@ -79,14 +79,24 @@ pub(super) struct AreaAvgX {
     pub(super) bg_x1: u32,
 }
 
-// Exclusive upper bounds: the output pixel covers source [x0, x1) x [y0, y1).
-// The old inclusive formula gave a 3x3 box at 2x downscale because x1 landed on
-// the first pixel of the next output cell; exclusive gives the correct 2x2.
+// The source pixels [x0, x1) that an output pixel's footprint [f, f + step),
+// in 1/FRAC source pixels, covers: those whose centres lie in it, so that
+// footprints tiling the source give each pixel to the output pixel that
+// covers most of it. A footprint that holds no centre reads the pixel
+// nearest its middle, the one the middle lies in. Flooring the bounds
+// instead read the pixel to the left of a footprint that starts just short
+// of a pixel's edge: at 181 -> 91 every output pixel took its left
+// neighbour. At an exact 2x downscale both read the same 2x2 block.
 pub(super) fn area_range(limit: u32, f: u32, step: u32) -> (u32, u32) {
-    (
-        (f >> FRACBITS).min(limit.saturating_sub(1)),
-        ((f + step) >> FRACBITS).min(limit),
-    )
+    let last = limit.saturating_sub(1);
+    let x0 = (f + FRAC / 2 - 1) >> FRACBITS;
+    let x1 = (f + step + FRAC / 2 - 1) >> FRACBITS;
+    if x1 > x0 {
+        (x0.min(last), x1.min(limit))
+    } else {
+        let nearest = ((f + step / 2) >> FRACBITS).min(last);
+        (nearest, (nearest + 1).min(limit))
+    }
 }
 
 pub(super) fn precompute_area_avg_x(
