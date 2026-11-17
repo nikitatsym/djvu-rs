@@ -177,7 +177,7 @@ impl<'a> ProgressiveDecoder<'a> {
                 fg44,
                 gamma_lut: build_gamma_lut(page.gamma()),
             },
-            bg_subsample: best_iw44_subsample(opts.decode_scale(page)),
+            bg_subsample: background_subsample(page, opts.decode_scale(page)),
             img: Arc::new(Iw44Image::new()),
             chunks_fed: 0,
         })
