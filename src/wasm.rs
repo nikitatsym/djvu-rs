@@ -447,23 +447,8 @@ impl WasmPage {
     pub fn text_zones_json(&self, target_dpi: u32) -> Result<Option<String>, JsError> {
         let page = crate::foreign::page(&self.doc, self.index)
             .map_err(|e| JsError::new(&e.to_string()))?;
-
-        let (render_w, render_h) = RenderSize::at_dpi(page, target_dpi as f32).display;
-
-        let Some(layer) = page
-            .text_layer_at_size(render_w, render_h)
-            .map_err(|e| JsError::new(&e.to_string()))?
-        else {
-            return Ok(None);
-        };
-
-        let mut buf = String::from("[");
-        let mut first = true;
-        for zone in &layer.zones {
-            collect_leaf_zones(zone, &mut buf, &mut first);
-        }
-        buf.push(']');
-        Ok(Some(buf))
+        crate::foreign::text_zones_json(page, target_dpi as f32)
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Number of BG44 background chunks on this page.
@@ -705,54 +690,6 @@ impl WasmPage {
     }
 }
 
-// ── Text zone helpers ─────────────────────────────────────────────────────────
-
-/// Recursively collect leaf zones (zones without children) into a JSON array.
-fn collect_leaf_zones(zone: &crate::text::TextZone, buf: &mut String, first: &mut bool) {
-    if zone.children.is_empty() {
-        let t = zone.text.trim();
-        if t.is_empty() {
-            return;
-        }
-        if !*first {
-            buf.push(',');
-        }
-        *first = false;
-        buf.push_str("{\"t\":\"");
-        json_escape_into(t, buf);
-        buf.push_str("\",\"x\":");
-        buf.push_str(&zone.rect.x.to_string());
-        buf.push_str(",\"y\":");
-        buf.push_str(&zone.rect.y.to_string());
-        buf.push_str(",\"w\":");
-        buf.push_str(&zone.rect.width.to_string());
-        buf.push_str(",\"h\":");
-        buf.push_str(&zone.rect.height.to_string());
-        buf.push('}');
-    } else {
-        for child in &zone.children {
-            collect_leaf_zones(child, buf, first);
-        }
-    }
-}
-
-/// Append `s` to `buf` with JSON string escaping (no surrounding quotes).
-fn json_escape_into(s: &str, buf: &mut String) {
-    for ch in s.chars() {
-        match ch {
-            '"' => buf.push_str("\\\""),
-            '\\' => buf.push_str("\\\\"),
-            '\n' => buf.push_str("\\n"),
-            '\r' => buf.push_str("\\r"),
-            '\t' => buf.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                buf.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => buf.push(c),
-        }
-    }
-}
-
 // ── Lazy Range-based open (#588, `wasm-lazy` feature) ────────────────────────
 
 #[cfg(all(feature = "async", target_arch = "wasm32"))]
@@ -985,6 +922,44 @@ mod lazy {
                 .map_err(|e| JsError::new(&e.to_string()))?;
             render(&page, target_dpi, chunk_n)
         }
+
+        /// Fetch (or reuse) page `index` and return its plain text, as
+        /// [`WasmPage::text`](super::WasmPage::text) does: `undefined` when
+        /// the page has no text layer.
+        pub async fn text(&self, index: u32) -> Result<Option<String>, JsError> {
+            let page = self
+                .inner
+                .page_async(index as usize)
+                .await
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            page_text(&page)
+        }
+
+        /// Fetch (or reuse) page `index` and return its text zones scaled to
+        /// a render at `target_dpi`, as
+        /// [`WasmPage::text_zones_json`](super::WasmPage::text_zones_json)
+        /// does: `undefined` when the page has no text layer.
+        pub async fn text_zones_json(
+            &self,
+            index: u32,
+            target_dpi: u32,
+        ) -> Result<Option<String>, JsError> {
+            let page = self
+                .inner
+                .page_async(index as usize)
+                .await
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            zones_json(&page, target_dpi)
+        }
+    }
+
+    fn page_text(page: &DjVuPage) -> Result<Option<String>, JsError> {
+        crate::foreign::page_text(page).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    fn zones_json(page: &DjVuPage, target_dpi: u32) -> Result<Option<String>, JsError> {
+        crate::foreign::text_zones_json(page, target_dpi as f32)
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Render `page` at `target_dpi`; `chunk_n == u32::MAX` decodes every
@@ -1135,6 +1110,25 @@ mod lazy {
         ) -> Result<WasmPixmap, JsError> {
             let page = self.page(index).await?;
             render(&page, target_dpi, chunk_n)
+        }
+
+        /// Fetch (or reuse) page `index` and return its plain text:
+        /// `undefined` when the page has no text layer.
+        pub async fn text(&self, index: u32) -> Result<Option<String>, JsError> {
+            let page = self.page(index).await?;
+            page_text(&page)
+        }
+
+        /// Fetch (or reuse) page `index` and return its text zones scaled to
+        /// a render at `target_dpi`: `undefined` when the page has no text
+        /// layer.
+        pub async fn text_zones_json(
+            &self,
+            index: u32,
+            target_dpi: u32,
+        ) -> Result<Option<String>, JsError> {
+            let page = self.page(index).await?;
+            zones_json(&page, target_dpi)
         }
 
         async fn page(&self, index: u32) -> Result<Arc<DjVuPage>, JsError> {
