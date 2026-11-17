@@ -83,6 +83,26 @@ fn render_progressive(
         .pixmap(page)
 }
 
+// ── Render cache budget ───────────────────────────────────────────────────────
+
+/// Set the budget, in bytes, for what pages keep decoded for their next
+/// render: the cached backgrounds, masks, pixmaps and tiles of every open
+/// document together (see `djvu_rs::render_cache`; 256 MiB unless set). Over
+/// it, the least recently used layers are dropped; a cache fill may exceed it
+/// by one layer for a while. It does not bound the rest of wasm memory: the
+/// documents' bytes, renders in progress and returned pixmaps. Returns the
+/// bytes freed at once.
+#[wasm_bindgen]
+pub fn set_render_cache_budget(bytes: f64) -> f64 {
+    crate::render_cache::set_budget(bytes as usize) as f64
+}
+
+/// Bytes the page render caches retain now.
+#[wasm_bindgen]
+pub fn render_cache_bytes() -> f64 {
+    crate::render_cache::resident_bytes() as f64
+}
+
 // ── WasmPixmap — Rust-owned pixel buffer (#611) ──────────────────────────────
 
 /// A Rust-owned RGBA pixel buffer that stays alive as long as JS holds the
