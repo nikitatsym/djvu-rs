@@ -1113,6 +1113,38 @@ mod tests {
         assert_eq!(page_a.height(), sync_page.height());
     }
 
+    /// A page fetched lazily gives the same text and text zones as the page
+    /// of the whole parsed document, so a viewer reading by ranges can lay
+    /// its hidden text over the page.
+    #[tokio::test]
+    async fn lazy_document_page_text_matches_sync() {
+        let path = assets_path().join("DjVu3Spec_bundled.djvu");
+        let bytes = std::fs::read(&path).expect("read DjVu3Spec fixture");
+        let sync_doc = DjVuDocument::parse(&bytes).expect("sync parse");
+        let lazy = from_async_reader_lazy(std::io::Cursor::new(bytes))
+            .await
+            .expect("lazy index");
+        for index in [0, 1, 5] {
+            let lazy_page = lazy.page_async(index).await.expect("lazy page");
+            let sync_page = sync_doc.page(index).expect("sync page");
+            let zones = crate::foreign::text_zones_json(&lazy_page, 150.0).expect("lazy zones");
+            assert!(
+                zones.as_deref().is_some_and(|z| z.len() > 2),
+                "page {index} has text zones"
+            );
+            assert_eq!(
+                zones,
+                crate::foreign::text_zones_json(sync_page, 150.0).expect("sync zones"),
+                "page {index}"
+            );
+            assert_eq!(
+                crate::foreign::page_text(&lazy_page).expect("lazy text"),
+                crate::foreign::page_text(sync_page).expect("sync text"),
+                "page {index}"
+            );
+        }
+    }
+
     /// #624: a lazy page with several `INCL` chunks (shared annotations +
     /// symbol dictionaries) must skip includes without a `Djbz` instead of
     /// failing on the first one.
