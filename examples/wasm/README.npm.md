@@ -16,7 +16,7 @@ when the engine supports it.
 | Fast preview, then sharpen | `WasmRenderRequest` with `set_coarse()` / `set_step(n)` |
 | Render only the visible viewport | `WasmRenderRequest` with `set_region(x, y, w, h)` |
 | Zoomable tiled viewer | `page.render_tile(dpi, size, col, row)` + `tile_cols` / `tile_rows` |
-| Extract text, or highlight words | `page.text()`, `page.text_zones_json(dpi)` (pixel boxes) |
+| Extract text, or highlight words | `page.text()`, `page.text_zones_json(dpi)` (pixel boxes); on a lazy document `await doc.text(i)`, `await doc.text_zones_json(i, dpi)` |
 | Convert to PDF, encode DjVu, OCR | Not in the JS package — use the [`djvu` CLI](https://github.com/matyushkin/djvu-rs/blob/main/docs/cli.md), [Python](https://pypi.org/project/djvu-rs/), or the Rust crate |
 
 ## Install
@@ -102,6 +102,7 @@ const doc = await WasmLazyDocument.open(size, async (offset, len) => {
 });
 const pm = await doc.render_page(0, 150);       // fetches only page 1
 ctx.putImageData(new ImageData(pm.view(), pm.width(), pm.height()), 0, 0);
+const zones = JSON.parse(await doc.text_zones_json(0, 150) ?? '[]'); // word boxes on that render
 ```
 
 `render_page_progressive(i, dpi, n)` draws a blurry-to-sharp first frame.
