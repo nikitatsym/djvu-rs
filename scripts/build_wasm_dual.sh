@@ -56,6 +56,14 @@ export let WasmLazyDocument;
 export let WasmLazyIndirectDocument;
 export let initThreadPool;
 
+export function set_render_cache_budget(bytes) {
+  return selectedModule.set_render_cache_budget(bytes);
+}
+
+export function render_cache_bytes() {
+  return selectedModule.render_cache_bytes();
+}
+
 export function wasmSimd128Supported() {
   return typeof WebAssembly === "object" && WebAssembly.validate(SIMD128_PROBE);
 }
