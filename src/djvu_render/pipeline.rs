@@ -69,7 +69,11 @@ impl<'p> Composite<'p> {
             Detail::Full => decode_layers(page, opts, bg_subsample, usize::MAX)?,
             Detail::Chunks(n) => decode_layers(page, opts, bg_subsample, n)?,
             Detail::Coarse => DecodedLayers {
-                bg: decode_background_chunks(page, 1, bg_subsample)?,
+                bg: decode_background_chunks(
+                    page,
+                    1,
+                    background_subsample(page, opts.decode_scale(page)),
+                )?,
                 fg_palette: None,
                 mask: None,
                 blit_map: None,
