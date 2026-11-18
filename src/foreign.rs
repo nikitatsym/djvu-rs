@@ -103,9 +103,84 @@ pub(crate) fn page_dpi(doc: &DjVuDocument, index: usize) -> Result<u32, ForeignE
 
 /// Plain text of page `index`, or `None` when the page has no text layer.
 pub(crate) fn text(doc: &DjVuDocument, index: usize) -> Result<Option<String>, ForeignError> {
-    page(doc, index)?
-        .text()
-        .map_err(|e| ForeignError::Decode(e.to_string()))
+    page_text(page(doc, index)?)
+}
+
+/// Plain text of `page`, or `None` when it has no text layer.
+pub(crate) fn page_text(page: &DjVuPage) -> Result<Option<String>, ForeignError> {
+    page.text().map_err(|e| ForeignError::Decode(e.to_string()))
+}
+
+/// The leaf text zones of `page` as a JSON array of
+/// `{"t":"…","x":N,"y":N,"w":N,"h":N}`, in pixels of a render at
+/// `target_dpi`; `None` when the page has no text layer.
+#[cfg_attr(not(feature = "wasm"), allow(dead_code))]
+pub(crate) fn text_zones_json(
+    page: &DjVuPage,
+    target_dpi: f32,
+) -> Result<Option<String>, ForeignError> {
+    let (render_w, render_h) = crate::render_size::RenderSize::at_dpi(page, target_dpi).display;
+    let Some(layer) = page
+        .text_layer_at_size(render_w, render_h)
+        .map_err(|e| ForeignError::Decode(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let mut buf = String::from("[");
+    let mut first = true;
+    for zone in &layer.zones {
+        collect_leaf_zones(zone, &mut buf, &mut first);
+    }
+    buf.push(']');
+    Ok(Some(buf))
+}
+
+/// Recursively collect leaf zones (zones without children) into a JSON array.
+#[cfg_attr(not(feature = "wasm"), allow(dead_code))]
+fn collect_leaf_zones(zone: &crate::text::TextZone, buf: &mut String, first: &mut bool) {
+    if zone.children.is_empty() {
+        let t = zone.text.trim();
+        if t.is_empty() {
+            return;
+        }
+        if !*first {
+            buf.push(',');
+        }
+        *first = false;
+        buf.push_str("{\"t\":\"");
+        json_escape_into(t, buf);
+        buf.push_str("\",\"x\":");
+        buf.push_str(&zone.rect.x.to_string());
+        buf.push_str(",\"y\":");
+        buf.push_str(&zone.rect.y.to_string());
+        buf.push_str(",\"w\":");
+        buf.push_str(&zone.rect.width.to_string());
+        buf.push_str(",\"h\":");
+        buf.push_str(&zone.rect.height.to_string());
+        buf.push('}');
+    } else {
+        for child in &zone.children {
+            collect_leaf_zones(child, buf, first);
+        }
+    }
+}
+
+/// Append `s` to `buf` with JSON string escaping (no surrounding quotes).
+#[cfg_attr(not(feature = "wasm"), allow(dead_code))]
+fn json_escape_into(s: &str, buf: &mut String) {
+    for ch in s.chars() {
+        match ch {
+            '"' => buf.push_str("\\\""),
+            '\\' => buf.push_str("\\\\"),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
+            '\t' => buf.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                buf.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => buf.push(c),
+        }
+    }
 }
 
 /// Canonical [`RenderOptions`] for rendering `page` at `target_dpi`.
