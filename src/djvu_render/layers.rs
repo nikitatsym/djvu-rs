@@ -36,6 +36,33 @@ pub(super) fn best_iw44_subsample(scale: f32) -> u32 {
     s.min(8)
 }
 
+/// The IW44 subsample `page`'s background decodes at for a render at `scale`
+/// of the page. The background may be stored at a fraction of the page's
+/// resolution (a third is common in scans); a plane already reduced by `red`
+/// needs `red` times less subsampling to cover the same output, or the render
+/// upscales a plane coarser than the output and comes out blurred.
+pub(super) fn background_subsample(page: &DjVuPage, scale: f32) -> u32 {
+    best_iw44_subsample(scale * background_reduction(page) as f32)
+}
+
+/// How many page pixels one pixel of the stored background spans: the
+/// reduction that turns the page size into the image size the first BG44
+/// chunk states (DjVu v3 IW44 chunk header: after the serial number, slice
+/// count and version bytes, the width and height as 16-bit big-endian values
+/// at bytes 4..8). 1 without BG44 or for a size no reduction gives.
+fn background_reduction(page: &DjVuPage) -> u32 {
+    let chunks = page.bg44_chunks();
+    let Some(&[w0, w1, h0, h1]) = chunks.first().and_then(|chunk| chunk.get(4..8)) else {
+        return 1;
+    };
+    let plane_w = u32::from(u16::from_be_bytes([w0, w1]));
+    let plane_h = u32::from(u16::from_be_bytes([h0, h1]));
+    let (page_w, page_h) = (page.width() as u32, page.height() as u32);
+    (1..=12u32)
+        .find(|&red| page_w.div_ceil(red) == plane_w && page_h.div_ceil(red) == plane_h)
+        .unwrap_or(1)
+}
+
 /// Max-pool 4× downsample of a bilevel mask.
 ///
 /// Each output pixel is 1 if any bit in the corresponding 4×4 block of `src`
@@ -536,8 +563,10 @@ impl<'a> PlaneView<'a> {
     }
 }
 
-/// Decode every layer needed for a full composite at `bg_subsample` — the one
-/// home for the permissive-vs-strict decode decision.
+/// Decode every layer needed for a full composite — the one home for the
+/// permissive-vs-strict decode decision. `bg_subsample` is the IW44 subsample
+/// of the render's scale of the page, which picks the 1/4-resolution mask; the
+/// background itself decodes at [`background_subsample`].
 ///
 /// In permissive mode each step swallows errors (`.ok().flatten()`) and the
 /// background stops at the first corrupt chunk; in strict mode any decode error
@@ -550,7 +579,7 @@ impl<'a> PlaneView<'a> {
 pub(super) fn decode_layers(
     page: &DjVuPage,
     opts: &RenderOptions,
-    bg_subsample: u32,
+    #[cfg_attr(not(feature = "std"), allow(unused_variables))] bg_subsample: u32,
     bg_chunk_limit: usize,
 ) -> Result<DecodedLayers, RenderError> {
     // #607 (round 89 follow-up): an eligible sub>=4 render skips the full JB2
@@ -574,6 +603,7 @@ pub(super) fn decode_layers(
     // `render_progressive` frames silently drop the text layer whenever this
     // cache happened to be warm — output depended on cache warmth (#691
     // slice 3 regression test `render_progressive_ignores_mask_sub4_warmth`).
+    let plane_subsample = background_subsample(page, opts.decode_scale(page));
     #[cfg(feature = "std")]
     if bg_chunk_limit == usize::MAX
         && bg_subsample >= 4
@@ -583,12 +613,12 @@ pub(super) fn decode_layers(
     {
         let (bg, fg44) = if opts.permissive {
             (
-                decode_background_chunks_permissive(page, bg_chunk_limit, bg_subsample),
+                decode_background_chunks_permissive(page, bg_chunk_limit, plane_subsample),
                 permissive_layer(decode_fg44(page), RecoveredLayer::Foreground),
             )
         } else {
             (
-                decode_background_chunks(page, bg_chunk_limit, bg_subsample)?,
+                decode_background_chunks(page, bg_chunk_limit, plane_subsample)?,
                 decode_fg44(page)?,
             )
         };
@@ -608,7 +638,7 @@ pub(super) fn decode_layers(
     let fg44;
 
     if opts.permissive {
-        bg = decode_background_chunks_permissive(page, bg_chunk_limit, bg_subsample);
+        bg = decode_background_chunks_permissive(page, bg_chunk_limit, plane_subsample);
         fg_palette = permissive_layer(
             decode_fg_palette_full(page),
             RecoveredLayer::ForegroundPalette,
@@ -634,12 +664,12 @@ pub(super) fn decode_layers(
         // the caches and return immediately, so the join is paid only when cold.
         #[cfg(feature = "parallel")]
         let (bg_res, fg_res) = rayon::join(
-            || decode_background_chunks(page, bg_chunk_limit, bg_subsample),
+            || decode_background_chunks(page, bg_chunk_limit, plane_subsample),
             || decode_foreground_strict(page),
         );
         #[cfg(not(feature = "parallel"))]
         let (bg_res, fg_res) = (
-            decode_background_chunks(page, bg_chunk_limit, bg_subsample),
+            decode_background_chunks(page, bg_chunk_limit, plane_subsample),
             decode_foreground_strict(page),
         );
         bg = bg_res?;
