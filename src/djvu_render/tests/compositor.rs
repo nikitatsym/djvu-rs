@@ -593,3 +593,114 @@ fn upscaled_region_matches_the_whole_render() {
         assert_eq!(px.as_slice(), &row[start..start + 4], "pixel {x}");
     }
 }
+
+/// A downscale reads the background pixels whose centres fall in an output
+/// pixel's footprint. A page 31 wide over 16 output pixels, its background
+/// at half its resolution (16 pixels), has a step of 31/16 page pixels,
+/// exact in sixteenths: output pixel 10 covers background positions
+/// [9.69, 10.66), mostly background pixel 10, and every output pixel has its
+/// own background pixel that way. Flooring the footprint's bounds read the
+/// pixel to its left, which moved a half-size render over a background
+/// decoded at subsample 2 a pixel right and down.
+#[test]
+fn downscale_reads_the_background_pixels_under_the_footprint() {
+    let lut = identity_lut();
+    for across in [true, false] {
+        let along = |n: u32| if across { (n, 1) } else { (1, n) };
+        let ((page_w, page_h), (out_w, out_h), (bg_w, bg_h)) = (along(31), along(16), along(16));
+        let opts = RenderOptions {
+            width: out_w,
+            height: out_h,
+            ..RenderOptions::default()
+        };
+        let mut bg = Pixmap::white(bg_w, bg_h);
+        let (x, y) = if across { (10, 0) } else { (0, 10) };
+        bg.set_rgb(x, y, 0, 0, 0);
+        let ctx = synth_ctx(&opts, page_w, page_h, Some(&bg), None, &lut, out_w, out_h);
+        let mut buf = vec![0u8; (out_w * out_h) as usize * 4];
+        composite_into(&ctx, &mut buf).unwrap();
+        let dark: Vec<usize> = buf
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, px)| px[0] < 128)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            dark,
+            vec![10],
+            "{}: the dark output pixels",
+            if across { "across" } else { "down" }
+        );
+    }
+}
+
+/// An output pixel whose footprint holds no source pixel's centre reads the
+/// source pixel nearest the footprint's middle. A page 4 wide over 3 output
+/// pixels, with a background or FG44 plane 2 wide, black then white: output
+/// pixel 1 covers plane positions [10/16, 20/16), whose middle, 15/16, lies
+/// nearer the black pixel's centre (8/16) than the white one's (24/16).
+#[test]
+fn downscale_without_a_covered_centre_reads_the_nearest_pixel() {
+    let lut = identity_lut();
+    for across in [true, false] {
+        let along = |n: u32| if across { (n, 1) } else { (1, n) };
+        let ((page_w, page_h), (out_w, out_h), (plane_w, plane_h)) = (along(4), along(3), along(2));
+        let opts = RenderOptions {
+            width: out_w,
+            height: out_h,
+            ..RenderOptions::default()
+        };
+        let mut plane = Pixmap::white(plane_w, plane_h);
+        plane.set_rgb(0, 0, 0, 0, 0);
+        let mut black = crate::bitmap::Bitmap::new(page_w, page_h);
+        for i in 0..4 {
+            let (x, y) = if across { (i, 0) } else { (0, i) };
+            black.set_black(x, y);
+        }
+        let mut fg = synth_ctx(
+            &opts,
+            page_w,
+            page_h,
+            None,
+            Some(&black),
+            &lut,
+            out_w,
+            out_h,
+        );
+        fg.fg44 = Some(&plane);
+        (fg.fg_x_q24, fg.fg_y_q24) = fg_q24(Some(&plane), page_w, page_h);
+        for (layer, ctx) in [
+            (
+                "background",
+                synth_ctx(
+                    &opts,
+                    page_w,
+                    page_h,
+                    Some(&plane),
+                    None,
+                    &lut,
+                    out_w,
+                    out_h,
+                ),
+            ),
+            ("FG44", fg),
+        ] {
+            let mut buf = vec![0u8; 3 * 4];
+            composite_into(&ctx, &mut buf).unwrap();
+            let dark: Vec<bool> = buf
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|px| px[0] < 128)
+                .collect();
+            assert_eq!(
+                dark,
+                vec![true, true, false],
+                "{layer} {}: the dark output pixels",
+                if across { "across" } else { "down" }
+            );
+        }
+    }
+}
