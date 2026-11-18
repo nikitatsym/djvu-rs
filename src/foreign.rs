@@ -165,7 +165,7 @@ fn collect_leaf_zones(zone: &crate::text::TextZone, buf: &mut String, first: &mu
 
 /// Append `s` to `buf` with JSON string escaping (no surrounding quotes).
 #[cfg_attr(not(feature = "wasm"), allow(dead_code))]
-fn json_escape_into(s: &str, buf: &mut String) {
+pub(crate) fn json_escape_into(s: &str, buf: &mut String) {
     for ch in s.chars() {
         match ch {
             '"' => buf.push_str("\\\""),
