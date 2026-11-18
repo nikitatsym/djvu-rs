@@ -79,15 +79,22 @@ pub(super) struct AreaAvgX {
     pub(super) fx_end: u32,
     pub(super) bg_x0: u32,
     pub(super) bg_x1: u32,
+    /// The FG44 plane's columns `[fg_x0, fg_x1)`; empty without FG44.
+    pub(super) fg_x0: u32,
+    pub(super) fg_x1: u32,
 }
 
-// Exclusive upper bounds: the output pixel covers source [x0, x1) x [y0, y1).
-// The old inclusive formula gave a 3x3 box at 2x downscale because x1 landed on
-// the first pixel of the next output cell; exclusive gives the correct 2x2.
-// A footprint inside one pixel, on the growing axis of a mixed scale, covers it.
+// Pixels whose centres the footprint holds, else the nearest; flooring read the left one.
 pub(super) fn area_range(limit: u32, f: u32, step: u32) -> (u32, u32) {
-    let x0 = (f >> FRACBITS).min(limit.saturating_sub(1));
-    (x0, ((f + step) >> FRACBITS).max(x0 + 1).min(limit))
+    let last = limit.saturating_sub(1);
+    let x0 = (f + FRAC / 2 - 1) >> FRACBITS;
+    let x1 = (f + step + FRAC / 2 - 1) >> FRACBITS;
+    if x1 > x0 {
+        (x0.min(last), x1.min(limit))
+    } else {
+        let nearest = ((f + step / 2) >> FRACBITS).min(last);
+        (nearest, (nearest + 1).min(limit))
+    }
 }
 
 pub(super) fn precompute_area_avg_x(ctx: &CompositeContext<'_>, fx_step: Step) -> Vec<AreaAvgX> {
@@ -103,11 +110,18 @@ pub(super) fn column_footprint(ctx: &CompositeContext<'_>, fx_step: Step, x: u32
     let bg_fx = ((fx as u64 * ctx.bg_x_q24) >> 24) as u32;
     let bg_fx_end = plane_end(fx_end, ctx.page_w, ctx.bg_x_q24);
     let (bg_x0, bg_x1) = area_range(ctx.bg.map_or(0, |bg| bg.width()), bg_fx, bg_fx_end - bg_fx);
+    let (fg_x0, fg_x1) = ctx.fg44.map_or((0, 0), |fg| {
+        let fg_fx = ((fx as u64 * ctx.fg_x_q24) >> 24) as u32;
+        let fg_fx_end = plane_end(fx_end, ctx.page_w, ctx.fg_x_q24);
+        area_range(fg.width, fg_fx, fg_fx_end - fg_fx)
+    });
     AreaAvgX {
         fx,
         fx_end,
         bg_x0,
         bg_x1,
+        fg_x0,
+        fg_x1,
     }
 }
 
@@ -1656,6 +1670,11 @@ pub(super) fn composite_rows_area_avg_one(
     let bg_y = ctx
         .bg
         .map(|bg| area_range(bg.height(), bg_fy, bg_fy_end - bg_fy));
+    let fg_y = ctx.fg44.map_or((0, 0), |fg| {
+        let fg_fy = ((fy as u64 * ctx.fg_y_q24) >> 24) as u32;
+        let fg_fy_end = plane_end(fy_end, ctx.page_h, ctx.fg_y_q24);
+        area_range(fg.height, fg_fy, fg_fy_end - fg_fy)
+    });
 
     // #438: row-level all-bg fast path (F2/I3 analog for the area-avg path). The
     // mask footprint's y-band [y0, y1) is row-invariant; if it has no foreground
@@ -1772,11 +1791,7 @@ pub(super) fn composite_rows_area_avg_one(
                 let color = lookup_palette_color(pal, ctx.blit_map, ctx.mask, cx, cy);
                 (color.r, color.g, color.b)
             } else if let Some(fg) = ctx.fg44 {
-                let fg_fx = ((fx as u64 * ctx.fg_x_q24) >> 24) as u32;
-                let fg_fy = ((fy as u64 * ctx.fg_y_q24) >> 24) as u32;
-                let fg_fx_end = plane_end(fx_end, ctx.page_w, ctx.fg_x_q24);
-                let fg_fy_end = plane_end(fy_end, ctx.page_h, ctx.fg_y_q24);
-                sample_area_avg(fg, fg_fx, fg_fy, fg_fx_end - fg_fx, fg_fy_end - fg_fy)
+                sample_area_avg_bounds(PlaneView::whole(fg), ax.fg_x0, ax.fg_x1, fg_y.0, fg_y.1)
             } else {
                 (0, 0, 0)
             }
