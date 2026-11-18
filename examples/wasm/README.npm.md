@@ -17,6 +17,7 @@ when the engine supports it.
 | Render only the visible viewport | `WasmRenderRequest` with `set_region(x, y, w, h)` |
 | Zoomable tiled viewer | `page.render_tile(dpi, size, col, row)` + `tile_cols` / `tile_rows` |
 | Extract text, or highlight words | `page.text()`, `page.text_zones_json(dpi)` (pixel boxes); on a lazy document `await doc.text(i)`, `await doc.text_zones_json(i, dpi)` |
+| Keep page caches small while reading a long book | `set_render_cache_budget(bytes)` sets the budget for what pages keep decoded (256 MiB unless set); `render_cache_bytes()` reports what they retain |
 | Convert to PDF, encode DjVu, OCR | Not in the JS package — use the [`djvu` CLI](https://github.com/matyushkin/djvu-rs/blob/main/docs/cli.md), [Python](https://pypi.org/project/djvu-rs/), or the Rust crate |
 
 ## Install
