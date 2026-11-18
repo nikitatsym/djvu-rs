@@ -877,6 +877,68 @@ fn metadata_and_bookmarks_keep_navm_after_dirm() {
     assert_eq!(declared, actual);
 }
 
+/// Older djvu-rs wrote a root `METz`/`METa` anywhere among root chunks; it wins.
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn lazy_metadata_reads_a_root_metz() {
+    use crate::metadata::{DjVuMetadata, encode_metadata, encode_metadata_bzz};
+
+    let metadata = DjVuMetadata {
+        title: Some("Atlas".into()),
+        author: Some("Mercator".into()),
+        ..DjVuMetadata::default()
+    };
+    let annotated = DjVuMetadata {
+        title: Some("Annotated".into()),
+        author: Some("Annotator".into()),
+        ..DjVuMetadata::default()
+    };
+    for (fixture, place) in [
+        ("navm_fgbz.djvu", "after DIRM"),
+        ("navm_fgbz.djvu", "between two components"),
+        ("navm_fgbz.djvu", "after the last component"),
+        ("chicken.djvu", "among the page's chunks"),
+    ] {
+        for (id, data) in [
+            (*b"METz", encode_metadata_bzz(&metadata)),
+            (*b"METa", encode_metadata(&metadata)),
+        ] {
+            let mut doc = DjVuDocumentMut::from_bytes(&read_corpus(fixture)).unwrap();
+            doc.set_metadata(&annotated).unwrap();
+            let Chunk::Form { children, .. } = &mut doc.file.root else {
+                unreachable!()
+            };
+            let index = match place {
+                "after DIRM" => 1,
+                "between two components" => children
+                    .iter()
+                    .rposition(|c| matches!(c, Chunk::Form { .. }))
+                    .unwrap(),
+                _ => children.len(),
+            };
+            children.insert(index, Chunk::Leaf { id, data });
+            doc.dirty = true;
+            let bytes = doc.into_bytes();
+            let label = format!("{fixture}, {} {place}", String::from_utf8_lossy(&id));
+            let whole = crate::djvu_document::DjVuDocument::parse(&bytes)
+                .unwrap()
+                .metadata()
+                .unwrap();
+            assert_eq!(whole.as_ref(), Some(&metadata), "{label}: parsed whole");
+            let lazy = crate::djvu_async::LazyDocument::from_async_reader_lazy(
+                std::io::Cursor::new(bytes),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                lazy.metadata_async().await.unwrap(),
+                whole,
+                "{label}: read lazily"
+            );
+        }
+    }
+}
+
 pub(super) fn component_kinds(bytes: &[u8]) -> Vec<DirmComponentKind> {
     let form = crate::iff::parse_form(bytes).unwrap();
     let dirm = form.chunks.iter().find(|c| &c.id == b"DIRM").unwrap();

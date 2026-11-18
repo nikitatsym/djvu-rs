@@ -345,6 +345,15 @@ impl WasmDocument {
         self.inner.page_count() as u32
     }
 
+    /// `{"title","author"}` with those present, else `undefined`; throws if undecodable.
+    pub fn metadata_json(&self) -> Result<Option<String>, JsError> {
+        let meta = self
+            .inner
+            .metadata()
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(title_author_json(meta.as_ref()))
+    }
+
     /// Render a contiguous batch of pages at `target_dpi`, returning one
     /// [`WasmPixmap`] per page in input order (#610).
     ///
@@ -704,6 +713,25 @@ impl WasmPage {
     }
 }
 
+/// `{"title","author"}` with the fields `meta` has, or `None` without either.
+fn title_author_json(meta: Option<&crate::metadata::DjVuMetadata>) -> Option<String> {
+    let meta = meta?;
+    let fields = [("title", &meta.title), ("author", &meta.author)];
+    let mut buf = String::from("{");
+    for (key, value) in fields {
+        let Some(value) = value else { continue };
+        if buf.len() > 1 {
+            buf.push(',');
+        }
+        buf.push('"');
+        buf.push_str(key);
+        buf.push_str("\":\"");
+        crate::foreign::json_escape_into(value, &mut buf);
+        buf.push('"');
+    }
+    buf.push('}');
+    (buf.len() > 2).then_some(buf)
+}
 // ── Lazy Range-based open (#588, `wasm-lazy` feature) ────────────────────────
 
 #[cfg(all(feature = "async", target_arch = "wasm32"))]
@@ -890,6 +918,16 @@ mod lazy {
         /// Number of pages in the index.
         pub fn page_count(&self) -> u32 {
             self.inner.page_count() as u32
+        }
+
+        /// As [`WasmDocument::metadata_json`](super::WasmDocument::metadata_json), by range.
+        pub async fn metadata_json(&self) -> Result<Option<String>, JsError> {
+            let meta = self
+                .inner
+                .metadata_async()
+                .await
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            Ok(super::title_author_json(meta.as_ref()))
         }
 
         /// Fetch (or reuse) page `index` and return `[width_px, height_px, dpi]`
@@ -1182,6 +1220,34 @@ mod native_tests {
     #[test]
     fn wasm_document_from_bytes_invalid_returns_error() {
         assert!(DjVuDocument::parse(b"not a djvu file").is_err());
+    }
+
+    /// The JSON names only the fields the metadata has, escaped.
+    #[test]
+    fn wasm_title_author_json() {
+        let meta = crate::metadata::DjVuMetadata {
+            title: Some("Tales \"from\" Tolstoi".into()),
+            year: Some("1903".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            title_author_json(Some(&meta)).as_deref(),
+            Some(r#"{"title":"Tales \"from\" Tolstoi"}"#)
+        );
+        let both = crate::metadata::DjVuMetadata {
+            author: Some("Leo Tolstoy".into()),
+            ..meta
+        };
+        assert_eq!(
+            title_author_json(Some(&both)).as_deref(),
+            Some(r#"{"title":"Tales \"from\" Tolstoi","author":"Leo Tolstoy"}"#)
+        );
+        let year_only = crate::metadata::DjVuMetadata {
+            year: Some("1903".into()),
+            ..Default::default()
+        };
+        assert_eq!(title_author_json(Some(&year_only)), None);
+        assert_eq!(title_author_json(None), None);
     }
 
     /// Page 0 of boy.djvu must report 100 dpi (value in INFO chunk).
